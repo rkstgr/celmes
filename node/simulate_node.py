@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simulated measurement node using Zenoh for communication
+Simplified measurement node simulation using Zenoh
 """
 
 import time
@@ -8,10 +8,8 @@ import json
 import random
 import uuid
 import logging
-from collections import deque
-from typing import Dict, List, Any
-import zenoh
 import numpy as np
+import zenoh
 
 # Configure logging
 logging.basicConfig(
@@ -19,35 +17,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SimNode")
 
+NODE_ID = "node-001"
+
 
 class SimulatedNode:
-    """
-    Simulates a Raspberry Pi measurement node with multiple Pi-plates
-    """
+    """Simulates a Raspberry Pi measurement node with multiple Pi-plates"""
 
     def __init__(self, node_id=None, num_plates=4):
         self.node_id = node_id or f"node-{uuid.uuid4().hex[:8]}"
         self.num_plates = num_plates
 
-        # Initialize simulated sensors
+        # Initialize environmental sensors with starting values
         self.env_data = {
             "temperature": 21.0,  # Celsius
             "humidity": 45.0,  # %
             "pressure": 1013.0,  # hPa
         }
 
-        # Initialize simulated Pi-plates with channels
+        # Initialize simulated Pi-plates
         self.plates = []
         for plate_idx in range(num_plates):
             channels = []
             for channel_idx in range(7):
-                # Each channel has a moving average of power readings
+                # Base power is now around 1.05mW with low variance
                 channels.append(
                     {
-                        "power_readings": deque(maxlen=10),
-                        "avg_power": 0.0,  # mW
+                        "power": 1.05,  # mW
                         "energy": 0.0,  # Wh
-                        "last_power": 0.0,  # Last raw reading
                     }
                 )
 
@@ -59,11 +55,9 @@ class SimulatedNode:
                 }
             )
 
-        # Initialize counters for 10-second events
-        self.counter = 0
-
         # Initialize Zenoh session
         self.zenoh_session = None
+        self.start_time = time.time()
 
     def connect_zenoh(self, config=None):
         """Connect to Zenoh network"""
@@ -73,11 +67,6 @@ class SimulatedNode:
         # Initialize publisher for data
         self.data_publisher = self.zenoh_session.declare_publisher(
             f"measurement/node/{self.node_id}/data"
-        )
-
-        # Initialize queryable to respond to control messages
-        self.control_queryable = self.zenoh_session.declare_queryable(
-            f"measurement/node/{self.node_id}/control", self._handle_control_query
         )
 
         # Subscribe to control messages
@@ -94,10 +83,10 @@ class SimulatedNode:
             logger.info("Zenoh session closed")
 
     def _update_environmental_data(self):
-        """Simulate changes in environmental data"""
-        self.env_data["temperature"] += random.uniform(-0.1, 0.1)
-        self.env_data["humidity"] += random.uniform(-0.5, 0.5)
-        self.env_data["pressure"] += random.uniform(-0.2, 0.2)
+        """Simulate small changes in environmental data"""
+        self.env_data["temperature"] += np.random.normal(0, 0.05)  # Smaller changes
+        self.env_data["humidity"] += np.random.normal(0, 0.1)
+        self.env_data["pressure"] += np.random.normal(0, 0.05)
 
         # Keep values in reasonable ranges
         self.env_data["temperature"] = max(15, min(30, self.env_data["temperature"]))
@@ -105,76 +94,80 @@ class SimulatedNode:
         self.env_data["pressure"] = max(990, min(1030, self.env_data["pressure"]))
 
     def _update_plate_readings(self):
-        """Simulate power and energy readings for each plate and channel"""
+        """Update power and energy readings"""
         for plate in self.plates:
             ref_voltage = plate["reference_voltage"]
+            voltage_factor = ref_voltage / 3.3  # Scale with reference voltage
 
-            for idx, channel in enumerate(plate["channels"]):
-                # Simulate power based on channel number (some channels use more power)
-                base_power = 100 * (idx + 1)  # Base power in mW
-
-                # Add some randomness and time-based patterns
-                time_factor = 1.0 + 0.1 * np.sin(time.time() / 3600)  # Daily pattern
-                noise = random.uniform(0.8, 1.2)
-
-                # Reference voltage affects the reading
-                voltage_factor = ref_voltage / 3.3
-
-                # Calculate new power reading
-                power = base_power * time_factor * noise * voltage_factor
-                channel["last_power"] = power
-
-                # Update moving average
-                channel["power_readings"].append(power)
-                channel["avg_power"] = sum(channel["power_readings"]) / len(
-                    channel["power_readings"]
-                )
+            for channel in plate["channels"]:
+                # Generate power with Gaussian noise around 1.05mW
+                # Scale by reference voltage
+                base_power = 1.05 * voltage_factor
+                noise = np.random.normal(0, 0.01)  # Very low variance
+                power = base_power + noise
+                channel["power"] = max(0, power)  # Prevent negative power
 
                 # Update energy (Wh) - convert mW to W and divide by 3600 for Wh per second
-                channel["energy"] += power / 1000 / 3600
+                channel["energy"] += channel["power"] / 1000 / 3600
 
-    def _save_data(self, env_data=True, measurement_data=True):
-        """Save environmental and measurement data to Zenoh"""
-        timestamp = int(time.time())
+    def _publish_data(self):
+        """Publish environmental and measurement data to Zenoh"""
+        timestamp = self._format_timestamp()
 
-        payload = {"node_id": self.node_id, "timestamp": timestamp, "data": {}}
+        payload = {
+            "node_id": self.node_id,
+            "timestamp": timestamp,
+            "data": {
+                "environment": {
+                    "temperature": round(self.env_data["temperature"], 2),
+                    "humidity": round(self.env_data["humidity"], 2),
+                    "pressure": round(self.env_data["pressure"], 2),
+                },
+                "plates": [],
+            },
+        }
 
-        # Add environmental data if needed
-        if env_data:
-            payload["data"]["environment"] = self.env_data.copy()
+        # Add plate data
+        for plate in self.plates:
+            plate_data = {
+                "plate_id": plate["plate_id"],
+                "reference_voltage": plate["reference_voltage"],
+                "channels": [],
+            }
 
-        # Add plate data if needed
-        if measurement_data:
-            plates_data = []
-            for plate in self.plates:
-                plate_data = {
-                    "plate_id": plate["plate_id"],
-                    "reference_voltage": plate["reference_voltage"],
-                    "channels": [],
-                }
+            for idx, channel in enumerate(plate["channels"]):
+                plate_data["channels"].append(
+                    {
+                        "channel": idx,
+                        "avg_power": round(channel["power"], 3),
+                        "energy": round(channel["energy"], 6),
+                    }
+                )
 
-                for idx, channel in enumerate(plate["channels"]):
-                    plate_data["channels"].append(
-                        {
-                            "channel": idx,
-                            "avg_power": round(channel["avg_power"], 2),
-                            "energy": round(channel["energy"], 4),
-                        }
-                    )
-
-                plates_data.append(plate_data)
-
-            payload["data"]["plates"] = plates_data
+            payload["data"]["plates"].append(plate_data)
 
         # Send data via Zenoh
         if self.zenoh_session:
             self.data_publisher.put(json.dumps(payload))
+        else:
+            logger.error("Zenoh session not connected")
+            exit(1)
 
     def _handle_control_message(self, sample):
         """Handle incoming control messages"""
         try:
-            message = json.loads(sample.payload.decode("utf-8"))
+            message = json.loads(sample.payload.to_string())
             logger.info(f"Received control message: {message}")
+
+            # Parse timestamp if present
+            if "timestamp" in message:
+                try:
+                    message_time = self._parse_timestamp(message["timestamp"])
+                    logger.debug(f"Message timestamp: {message_time}")
+                except ValueError:
+                    logger.warning(
+                        f"Invalid timestamp format in message: {message['timestamp']}"
+                    )
 
             if message.get("action") == "set_reference_voltage":
                 plate_id = message.get("plate_id")
@@ -195,7 +188,7 @@ class SimulatedNode:
                                     "plate_id": plate_id,
                                     "value": new_voltage,
                                     "status": "success",
-                                    "timestamp": int(time.time()),
+                                    "timestamp": self._format_timestamp(),
                                 }
                             )
                         )
@@ -204,41 +197,6 @@ class SimulatedNode:
             logger.error("Failed to parse control message")
         except Exception as e:
             logger.error(f"Error handling control message: {str(e)}")
-
-    def _handle_control_query(self, query):
-        """Handle queries for node status and control"""
-        try:
-            selector = query.selector
-
-            # Check what information is being requested
-            if "/status" in selector:
-                # Respond with node status
-                status_data = {
-                    "node_id": self.node_id,
-                    "status": "online",
-                    "plates": len(self.plates),
-                    "uptime": int(time.time()),  # Just using current time for sim
-                    "timestamp": int(time.time()),
-                }
-                query.reply(json.dumps(status_data))
-
-            elif "/config" in selector:
-                # Respond with configuration
-                config_data = {
-                    "node_id": self.node_id,
-                    "plates": [
-                        {
-                            "plate_id": plate["plate_id"],
-                            "reference_voltage": plate["reference_voltage"],
-                        }
-                        for plate in self.plates
-                    ],
-                    "timestamp": int(time.time()),
-                }
-                query.reply(json.dumps(config_data))
-
-        except Exception as e:
-            logger.error(f"Error handling query: {str(e)}")
 
     def _set_reference_voltage(self, plate_id, voltage):
         """Set reference voltage for a specific plate"""
@@ -257,25 +215,31 @@ class SimulatedNode:
         logger.warning(f"Plate {plate_id} not found")
         return False
 
+    def _format_timestamp(self):
+        """Get current time formatted as YYYY-MM-DD HH:MM:SS +ZZZZ"""
+        return time.strftime("%Y-%m-%d %H:%M:%S %z")
+
+    def _parse_timestamp(self, timestamp_str):
+        """Parse a timestamp string in the format YYYY-MM-DD HH:MM:SS +ZZZZ"""
+        from datetime import datetime
+
+        return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S %z")
+
     def run(self):
-        """Main simulation loop"""
+        """Main simulation loop - publish data every second"""
         logger.info(
             f"Starting simulated node {self.node_id} with {self.num_plates} plates"
         )
 
         try:
             while True:
-                # Update data every second
+                # Update data
                 self._update_environmental_data()
                 self._update_plate_readings()
 
-                # Increment counter
-                self.counter += 1
-
-                # Every 10 seconds, save environmental and measurement data
-                if self.counter % 10 == 0:
-                    self._save_data(env_data=True, measurement_data=True)
-                    logger.info(f"Saved full data for node {self.node_id}")
+                # Publish data every second
+                self._publish_data()
+                logger.debug(f"Published data for node {self.node_id}")
 
                 # Wait for next second
                 time.sleep(1)
@@ -291,11 +255,9 @@ class SimulatedNode:
 def main():
     """Main function"""
     # Create a simulated node
-    node = SimulatedNode(num_plates=4)
+    node = SimulatedNode(node_id=NODE_ID, num_plates=4)
 
     # Connect to Zenoh
-    # For a real implementation you might add config like:
-    # config = {"peers": ["tcp/192.168.1.100:7447"]}
     node.connect_zenoh()
 
     # Run the simulation
