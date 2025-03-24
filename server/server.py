@@ -21,7 +21,9 @@ from contextlib import asynccontextmanager
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("MeasurementServer")
 
@@ -54,25 +56,35 @@ class DataCollector:
         self.zenoh_session = None
         self.running = False
         self.nodes = {}  # Track known nodes
+        self.db_conn = None  # Persistent database connection
 
     def connect_db(self):
-        """Connect to TimescaleDB"""
+        """Connect to TimescaleDB if not already connected"""
+        if self.db_conn and not self.db_conn.closed:
+            return self.db_conn
+
         try:
             logger.info(
-                f"Connecting to database {self.db_params.get('dbname')} at {self.db_params.get('host')}:{self.db_params.get('port')}"
+                f"Server starting with DB {self.db_params.get('dbname')}@{self.db_params.get('host')}:{self.db_params.get('port')}"
             )
-            conn = psycopg2.connect(
+            self.db_conn = psycopg2.connect(
                 host=self.db_params.get("host", "localhost"),
                 port=self.db_params.get("port", 5432),
                 dbname=self.db_params.get("dbname", "measurement_db"),
                 user=self.db_params.get("user", "postgres"),
                 password=self.db_params.get("password", "password"),
             )
-            logger.info("Successfully connected to database")
-            return conn
+            return self.db_conn
         except Exception as e:
-            logger.error(f"Failed to connect to database: {str(e)}")
+            logger.error(f"Database connection failed: {str(e)}")
             raise
+
+    def close_db(self):
+        """Close database connection"""
+        if self.db_conn:
+            self.db_conn.close()
+            self.db_conn = None
+            logger.info("Database connection closed")
 
     def setup_db(self):
         """Set up database tables and TimescaleDB hypertables"""
@@ -177,14 +189,11 @@ class DataCollector:
 
             # Commit changes
             conn.commit()
-            logger.info("Database setup complete")
+            logger.info("Database tables initialized")
 
         except Exception as e:
             conn.rollback()
             logger.error(f"Error setting up database: {str(e)}")
-        finally:
-            cursor.close()
-            conn.close()
 
     def connect_zenoh(self, config=None):
         """Connect to Zenoh network"""
@@ -204,39 +213,24 @@ class DataCollector:
     def start_collecting(self):
         """Start collecting data from nodes"""
         if self.running:
-            logger.info("Data collection already running, skipping startup")
             return
 
         self.running = True
-        logger.info("Starting data collection")
-
         try:
-            # Subscribe to all node data
             data_key_expr = "measurement/node/*/data"
-            logger.info(f"Subscribing to node data with key: {data_key_expr}")
+            discovery_key_expr = "measurement/discovery"
+
             self.subscriber = self.zenoh_session.declare_subscriber(
                 data_key_expr, self._handle_data
-            )
-            logger.info(f"Successfully subscribed to node data")
-
-            # Declare queryable for node discovery
-            discovery_key_expr = "measurement/discovery"
-            logger.info(
-                f"Declaring queryable for discovery with key: {discovery_key_expr}"
             )
             self.discovery_queryable = self.zenoh_session.declare_queryable(
                 discovery_key_expr, self._handle_discovery_query
             )
-            logger.info(f"Successfully registered discovery queryable")
-
-            # Verify the subscriber is working
-            logger.info(
-                f"Data collection service started and ready - waiting for node data"
-            )
+            logger.info("Data collection started - Zenoh ready")
 
         except Exception as e:
             self.running = False
-            logger.error(f"Error starting data collection: {str(e)}")
+            logger.error(f"Failed to start collection: {str(e)}")
             raise
 
     def stop_collecting(self):
@@ -249,64 +243,47 @@ class DataCollector:
             self.zenoh_session.close()
             logger.info("Zenoh session closed")
 
+        self.close_db()  # Close database connection when stopping
+
     def _handle_data(self, sample):
         """Process incoming data from nodes"""
         try:
-            # Add logging for the raw data received
-            logger.info(f"Received data on key: {sample.key_expr}")
-
-            # Parse data
             payload = json.loads(sample.payload.to_string())
-
-            # Extract key fields
             node_id = payload.get("node_id")
             timestamp = payload.get("timestamp")
             data = payload.get("data", {})
 
-            logger.info(f"Received data from node {node_id} at timestamp {timestamp}")
-
             if not node_id or not timestamp or not data:
-                logger.warning("Missing required fields in data payload")
+                logger.warning(f"Invalid data payload from {node_id}")
                 return
 
-            # Log data structure for debugging
-            logger.info(f"Data contains: {', '.join(data.keys())}")
-
-            # Convert timestamp to datetime
             dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S %z")
-
-            # Ensure node exists in database
             self._ensure_node_exists(node_id)
 
-            # Process environmental data
             if "environment" in data:
-                env_data = data["environment"]
+                env = data["environment"]
                 logger.info(
-                    f"Processing environmental data: temp={env_data.get('temperature'):.1f}°C, humidity={env_data.get('humidity'):.1f}%, pressure={env_data.get('pressure'):.1f}hPa"
+                    f"Node {node_id}: env({env.get('temperature'):.1f}°C, {env.get('humidity'):.1f}%, {env.get('pressure'):.1f}hPa)"
                 )
-                self._store_environmental_data(node_id, dt, env_data)
+                self._store_environmental_data(node_id, dt, env)
 
-            # Process plate data
             if "plates" in data:
-                logger.info(f"Processing data for {len(data['plates'])} plates")
+                total_channels = sum(len(p.get("channels", [])) for p in data["plates"])
                 self._store_plate_data(node_id, dt, data["plates"])
+                logger.info(
+                    f"Node {node_id}: stored {total_channels} channels across {len(data['plates'])} plates"
+                )
 
-            # Update node last seen
             self._update_node_last_seen(node_id, dt)
 
-            logger.info(f"Successfully processed data from node {node_id}")
-
         except json.JSONDecodeError:
-            logger.error(
-                f"Failed to parse data payload: {sample.payload.decode('utf-8', errors='replace')}"
-            )
+            logger.error("Invalid JSON payload")
         except Exception as e:
-            logger.error(f"Error processing data: {str(e)}")
+            logger.error(f"Data processing failed: {str(e)}")
 
     def _handle_discovery_query(self, query):
         """Handle discovery queries"""
         try:
-            # Return list of known nodes
             nodes_list = list(self.nodes.values())
             query.reply(
                 json.dumps(
@@ -316,8 +293,9 @@ class DataCollector:
                     }
                 )
             )
+            logger.debug(f"Discovery query: returned {len(nodes_list)} nodes")
         except Exception as e:
-            logger.error(f"Error handling discovery query: {str(e)}")
+            logger.error(f"Discovery query failed: {str(e)}")
 
     def _ensure_node_exists(self, node_id):
         """Make sure the node exists in the database"""
@@ -325,9 +303,7 @@ class DataCollector:
             return
 
         try:
-            conn = self.connect_db()
-            cursor = conn.cursor()
-
+            cursor = self.connect_db().cursor()
             # Check if node exists
             cursor.execute("SELECT 1 FROM node WHERE node_id = %s", (node_id,))
             if not cursor.fetchone():
@@ -336,7 +312,7 @@ class DataCollector:
                     "INSERT INTO node (node_id, last_seen) VALUES (%s, NOW())",
                     (node_id,),
                 )
-                conn.commit()
+                self.db_conn.commit()
                 logger.info(f"Added new node: {node_id}")
 
             # Add to in-memory cache
@@ -344,44 +320,36 @@ class DataCollector:
                 "node_id": node_id,
                 "last_seen": datetime.now().isoformat(),
             }
-
         except Exception as e:
             logger.error(f"Error ensuring node exists: {str(e)}")
+            if isinstance(e, psycopg2.Error):
+                self.close_db()
         finally:
-            cursor.close()
-            conn.close()
+            cursor.close()  # Only close cursor
 
     def _update_node_last_seen(self, node_id, timestamp):
         """Update node's last seen timestamp"""
         try:
-            conn = self.connect_db()
-            cursor = conn.cursor()
-
+            cursor = self.connect_db().cursor()
             cursor.execute(
                 "UPDATE node SET last_seen = %s WHERE node_id = %s",
                 (timestamp, node_id),
             )
-
-            conn.commit()
-
+            self.db_conn.commit()
             # Update in-memory cache
             if node_id in self.nodes:
                 self.nodes[node_id]["last_seen"] = timestamp.isoformat()
-
         except Exception as e:
             logger.error(f"Error updating node last seen: {str(e)}")
+            if isinstance(e, psycopg2.Error):
+                self.close_db()
         finally:
-            cursor.close()
-            conn.close()
+            cursor.close()  # Only close cursor
 
     def _store_environmental_data(self, node_id, timestamp, env_data):
         """Store environmental data in TimescaleDB"""
         try:
-            logger.info(
-                f"Connecting to DB to store environmental data for node {node_id}"
-            )
-            conn = self.connect_db()
-            cursor = conn.cursor()
+            cursor = self.connect_db().cursor()
 
             temperature = env_data.get("temperature")
             humidity = env_data.get("humidity")
@@ -402,23 +370,18 @@ class DataCollector:
                 ),
             )
 
-            conn.commit()
-            logger.info(f"Successfully stored environmental data for node {node_id}")
+            self.db_conn.commit()
 
         except Exception as e:
             logger.error(f"Error storing environmental data: {str(e)}")
-        finally:
-            cursor.close()
-            conn.close()
+            if isinstance(e, psycopg2.Error):
+                self.close_db()  # Only close connection on database errors
 
     def _store_plate_data(self, node_id, timestamp, plates_data):
         """Store plate and channel data in TimescaleDB"""
         try:
-            logger.info(f"Processing plate data for node {node_id}")
-            conn = self.connect_db()
-            cursor = conn.cursor()
+            cursor = self.connect_db().cursor()
 
-            total_channels = 0
             for plate in plates_data:
                 plate_id = plate.get("plate_id")
                 ref_voltage = plate.get("reference_voltage")
@@ -444,37 +407,34 @@ class DataCollector:
                     power_mW = channel_data.get("power_mW")
                     energy_Wh = channel_data.get("energy_Wh")
 
-                    # Combine check, insert (if needed), and get cell_id in one query
+                    # Check if this path already has a mapping
                     cursor.execute(
                         """
-                        WITH ensure_mapping AS (
+                        SELECT 1 FROM path_cell_mapping
+                        WHERE node_id = %s AND plate_id = %s AND channel = %s
+                        AND end_time IS NULL
+                        """,
+                        (node_id, plate_id, channel),
+                    )
+
+                    # If no mapping exists, create default mapping to 'unconfigured'
+                    if not cursor.fetchone():
+                        logger.debug(
+                            f"New mapping: {node_id}/{plate_id}/channel-{channel} -> unconfigured"
+                        )
+                        cursor.execute(
+                            """
                             INSERT INTO path_cell_mapping
                             (node_id, plate_id, channel, cell_id, start_time)
                             VALUES (%s, %s, %s, 'unconfigured', %s)
-                            ON CONFLICT (node_id, plate_id, channel) 
-                            WHERE end_time IS NULL
-                            DO NOTHING
-                            RETURNING cell_id
+                            """,
+                            (node_id, plate_id, channel, timestamp),
                         )
-                        SELECT cell_id 
-                        FROM path_cell_mapping
-                        WHERE node_id = %s AND plate_id = %s AND channel = %s
-                        AND start_time <= %s AND (end_time IS NULL OR end_time > %s)
-                        ORDER BY start_time DESC LIMIT 1
-                        """,
-                        (
-                            node_id,
-                            plate_id,
-                            channel,
-                            timestamp,  # for INSERT
-                            node_id,
-                            plate_id,
-                            channel,
-                            timestamp,
-                            timestamp,  # for SELECT
-                        ),
+
+                    # Get current cell_id for this path using same connection
+                    cell_id = self._get_cell_for_path(
+                        node_id, plate_id, channel, timestamp, cursor
                     )
-                    cell_id = cursor.fetchone()[0]
 
                     cursor.execute(
                         """
@@ -492,48 +452,46 @@ class DataCollector:
                             energy_Wh,
                         ),
                     )
-                    total_channels += 1
 
-                conn.commit()
+                cursor.execute(
+                    """
+                    UPDATE path_cell_mapping
+                    SET end_time = %s
+                    WHERE node_id = %s AND plate_id = %s AND channel = %s
+                    AND end_time IS NULL
+                    """,
+                    (datetime.now(timezone.utc), node_id, plate_id, channel),
+                )
 
-            logger.info(
-                f"Stored data for {len(plates_data)} plates and {total_channels} channels from node {node_id}"
-            )
+                self.db_conn.commit()
 
         except Exception as e:
-            logger.error(f"Error storing plate data: {str(e)}")
+            logger.error(f"Plate data storage failed for {node_id}: {str(e)}")
+            if isinstance(e, psycopg2.Error):
+                self.close_db()
+            raise
         finally:
             cursor.close()
-            conn.close()
 
-    def _get_cell_for_path(self, node_id, plate_id, channel, timestamp):
-        """Get the cell_id for a path at a specific time"""
+    def _get_cell_for_path(self, node_id, plate_id, channel, timestamp, cursor):
+        """Get the cell_id for a path at a specific time using existing cursor"""
         try:
-            conn = self.connect_db()
-            cursor = conn.cursor()
-
             cursor.execute(
                 """
                 SELECT cell_id FROM path_cell_mapping
-            WHERE node_id = %s AND plate_id = %s AND channel = %s
-            AND start_time <= %s AND (end_time IS NULL OR end_time > %s)
-            ORDER BY start_time DESC LIMIT 1
-            """,
+                WHERE node_id = %s AND plate_id = %s AND channel = %s
+                AND start_time <= %s AND (end_time IS NULL OR end_time > %s)
+                ORDER BY start_time DESC LIMIT 1
+                """,
                 (node_id, plate_id, channel, timestamp, timestamp),
             )
 
             result = cursor.fetchone()
-            if result:
-                return result[0]
-            else:
-                # Return a placeholder or default "unconfigured" cell
-                return "unconfigured"
+            return result[0] if result else "unconfigured"
         except Exception as e:
             logger.error(f"Error getting cell for path: {str(e)}")
             return "unconfigured"
-        finally:
-            cursor.close()
-            conn.close()
+        # Don't close cursor here since it's passed in
 
     def get_nodes(self):
         """Get list of all nodes from database"""
@@ -563,8 +521,7 @@ class DataCollector:
             logger.error(f"Error getting nodes: {str(e)}")
             return []
         finally:
-            cursor.close()
-            conn.close()
+            cursor.close()  # Only close cursor
 
     def update_node_config(self, node_config: NodeConfig):
         """Update node configuration"""
@@ -618,61 +575,47 @@ class DataCollector:
             logger.error(f"Error updating node config: {str(e)}")
             return False
         finally:
-            cursor.close()
-            conn.close()
+            cursor.close()  # Only close cursor
 
     def send_control_message(self, node_id: str, action: str, **params):
         """Send control message to node"""
         if not self.zenoh_session:
-            logger.error("Zenoh session not initialized")
+            logger.error("No Zenoh session")
             return False
 
         try:
-            # Create message
             message = {"action": action, "timestamp": int(time.time()), **params}
-
-            # Send via Zenoh
             publisher = self.zenoh_session.declare_publisher(
                 f"measurement/node/{node_id}/control"
             )
             publisher.put(json.dumps(message))
-
-            logger.info(f"Sent {action} command to node {node_id}")
+            logger.info(f"Node {node_id}: sent {action}")
             return True
-
         except Exception as e:
-            logger.error(f"Error sending control message: {str(e)}")
+            logger.error(f"Control message failed: {str(e)}")
             return False
 
     def reassign_path_to_cell(self, node_id, plate_id, channel, new_cell_id):
         """Reassign a path to a new cell"""
-        now = datetime.now(timezone.utc)
+        try:
+            now = datetime.now(timezone.utc)
+            cursor = self.connect_db().cursor()
 
-        conn = self.connect_db()
-        cursor = conn.cursor()
-
-        # End the current mapping
-        cursor.execute(
-            """
-            UPDATE path_cell_mapping
-            SET end_time = %s
-            WHERE node_id = %s AND plate_id = %s AND channel = %s
-            AND end_time IS NULL
-            """,
-            (now, node_id, plate_id, channel),
-        )
-
-        # Create the new mapping
-        cursor.execute(
-            """
-            INSERT INTO path_cell_mapping
-            (node_id, plate_id, channel, cell_id, start_time)
-            VALUES (%s, %s, %s, %s, %s)
-            """,
-            (node_id, plate_id, channel, new_cell_id, now),
-        )
-
-        conn.commit()
+            # End current mapping and create new one
+            cursor.execute(
+                "UPDATE path_cell_mapping SET end_time = %s WHERE node_id = %s AND plate_id = %s AND channel = %s AND end_time IS NULL",
+                (now, node_id, plate_id, channel),
+            )
+            cursor.execute(
+                "INSERT INTO path_cell_mapping (node_id, plate_id, channel, cell_id, start_time) VALUES (%s, %s, %s, %s, %s)",
+                (node_id, plate_id, channel, new_cell_id, now),
+            )
+            self.db_conn.commit()
+            logger.info(
+                f"Node {node_id}: reassigned {plate_id}/ch{channel} -> {new_cell_id}"
+            )
+        finally:
+            cursor.close()
 
 
 @asynccontextmanager
@@ -699,12 +642,13 @@ async def lifespan(app: FastAPI):
         logger.info("Data collector initialized and started")
     except Exception as e:
         logger.error(f"Failed to initialize data collector: {str(e)}")
+        collector.close_db()  # Ensure DB connection is closed if startup fails
 
     yield
 
     # Shutdown
     if collector:
-        collector.stop_collecting()
+        collector.stop_collecting()  # This will close both Zenoh and DB connections
 
 
 # Create FastAPI app with lifespan
@@ -821,9 +765,6 @@ async def get_environmental_data(
     except Exception as e:
         logger.error(f"Error querying environmental data: {str(e)}")
         raise HTTPException(status_code=500, detail="Database query error")
-    finally:
-        cursor.close()
-        conn.close()
 
 
 @app.get("/api/data/power")
@@ -886,9 +827,6 @@ async def get_power_data(
     except Exception as e:
         logger.error(f"Error querying power data: {str(e)}")
         raise HTTPException(status_code=500, detail="Database query error")
-    finally:
-        cursor.close()
-        conn.close()
 
 
 # Run server when script is executed directly
