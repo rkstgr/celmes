@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
+import threading  # Add this import at the top with other imports
 
 # Configure logging
 logging.basicConfig(
@@ -211,21 +212,52 @@ class DataCollector:
             raise
 
     def start_collecting(self):
-        """Start collecting data from nodes"""
+        """Start collecting data from nodes - enhanced for buffering support"""
         if self.running:
             return
 
         self.running = True
         try:
+            # Subscribe to regular data
             data_key_expr = "measurement/node/*/data"
-            discovery_key_expr = "measurement/discovery"
-
             self.subscriber = self.zenoh_session.declare_subscriber(
                 data_key_expr, self._handle_data
             )
-            self.discovery_queryable = self.zenoh_session.declare_queryable(
-                discovery_key_expr, self._handle_discovery_query
+
+            # Subscribe to buffered data
+            buffered_data_key_expr = "measurement/node/*/buffered_data"
+            self.buffered_subscriber = self.zenoh_session.declare_subscriber(
+                buffered_data_key_expr, self._handle_buffered_data
             )
+
+            # Subscribe to buffer batch metadata
+            batch_key_expr = "measurement/node/*/buffer_batch"
+            self.batch_subscriber = self.zenoh_session.declare_subscriber(
+                batch_key_expr, self._handle_buffer_batch
+            )
+
+            # Subscribe to node pings
+            ping_key_expr = "measurement/node/*/ping"
+            self.ping_subscriber = self.zenoh_session.declare_subscriber(
+                ping_key_expr, self._handle_ping
+            )
+
+            # Initialize heartbeat publisher
+            self.heartbeat_publisher = self.zenoh_session.declare_publisher(
+                "measurement/server/heartbeat"
+            )
+
+            # Start heartbeat thread
+            self.heartbeat_thread = threading.Thread(
+                target=self._send_heartbeats, daemon=True
+            )
+            self.heartbeat_thread.start()
+
+            # Regular discovery queryable
+            self.discovery_queryable = self.zenoh_session.declare_queryable(
+                "measurement/discovery", self._handle_discovery_query
+            )
+
             logger.info("Data collection started - Zenoh ready")
 
         except Exception as e:
@@ -233,12 +265,87 @@ class DataCollector:
             logger.error(f"Failed to start collection: {str(e)}")
             raise
 
+    def _send_heartbeats(self):
+        """Send periodic heartbeats to let nodes know the server is online"""
+        while self.running:
+            try:
+                self.heartbeat_publisher.put(
+                    json.dumps({"timestamp": int(time.time()), "status": "online"})
+                )
+                time.sleep(1)  # Send heartbeat every second
+            except Exception as e:
+                logger.error(f"Error sending heartbeat: {str(e)}")
+                time.sleep(5)  # Back off on error
+
+    def _handle_ping(self, sample):
+        """Handle ping messages from nodes"""
+        try:
+            message = json.loads(sample.payload.to_string())
+            node_id = message.get("node_id")
+
+            # Immediately respond with a targeted heartbeat
+            if node_id:
+                ack_publisher = self.zenoh_session.declare_publisher(
+                    "measurement/server/heartbeat"
+                )
+                ack_publisher.put(
+                    json.dumps(
+                        {
+                            "timestamp": int(time.time()),
+                            "status": "online",
+                            "response_to": node_id,
+                        }
+                    )
+                )
+                logger.debug(f"Responded to ping from node {node_id}")
+        except Exception as e:
+            logger.error(f"Error handling ping: {str(e)}")
+
+    def _handle_buffered_data(self, sample):
+        """Process incoming buffered data from nodes"""
+        # Use the same processing logic as regular data
+        self._handle_data(sample)
+        logger.debug("Processed buffered data")
+
+    def _handle_buffer_batch(self, sample):
+        """Handle buffer batch metadata and send acknowledgments"""
+        try:
+            message = json.loads(sample.payload.to_string())
+            node_id = message.get("node_id")
+            batch_id = message.get("batch_id")
+            count = message.get("count", 0)
+
+            if node_id and batch_id:
+                # Send acknowledgment back to the node
+                ack_publisher = self.zenoh_session.declare_publisher(
+                    f"measurement/server/ack/{node_id}"
+                )
+                ack_publisher.put(
+                    json.dumps(
+                        {
+                            "batch_id": batch_id,
+                            "success": True,
+                            "timestamp": int(time.time()),
+                        }
+                    )
+                )
+                logger.info(
+                    f"Acknowledged batch of {count} measurements from node {node_id}"
+                )
+        except Exception as e:
+            logger.error(f"Error handling buffer batch: {str(e)}")
+
     def stop_collecting(self):
         """Stop collecting data"""
         if not self.running:
             return
 
         self.running = False
+
+        # Stop heartbeat thread
+        if hasattr(self, "heartbeat_thread"):
+            self.heartbeat_thread.join(timeout=2)
+
         if self.zenoh_session:
             self.zenoh_session.close()
             logger.info("Zenoh session closed")

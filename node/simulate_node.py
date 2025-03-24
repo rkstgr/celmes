@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simplified measurement node simulation using Zenoh
+Enhanced measurement node with local buffering for offline server scenarios
 """
 
 import time
@@ -10,22 +10,39 @@ import uuid
 import logging
 import numpy as np
 import zenoh
+import sqlite3
+import os
+import threading
+from datetime import datetime
+from queue import Queue, Empty
+import signal
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("SimNode")
+logger = logging.getLogger("BufferedNode")
 
 NODE_ID = "node-000"
+BUFFER_DB_PATH = "measurement_buffer.db"
+MAX_BUFFER_SIZE = 100000  # Maximum number of measurements to buffer
+RETRY_INTERVAL = 10  # Seconds between retry attempts when server is offline
+SERVER_TIMEOUT = 5  # Seconds to wait for server response before considering it offline
+RECONNECT_RETRIES = 3  # Number of retries before declaring server offline
+BUFFER_BATCH_SIZE = 50  # Number of buffered measurements to send in one batch
 
 
-class SimulatedNode:
-    """Simulates a Raspberry Pi measurement node with multiple Pi-plates"""
+class BufferedNode:
+    """Simulates a Raspberry Pi measurement node with offline buffering capability"""
 
     def __init__(self, node_id=None, num_plates=4):
         self.node_id = node_id or f"node-{uuid.uuid4().hex[:8]}"
         self.num_plates = num_plates
+        self.server_online = False
+        self.publish_queue = Queue()
+        self.buffer_count = 0
+        self.is_sending_buffer = False
+        self.stopping = False
 
         # Initialize environmental sensors with starting values
         self.env_data = {
@@ -39,53 +56,153 @@ class SimulatedNode:
         for plate_idx in range(num_plates):
             channels = []
             for channel_idx in range(7):
-                # Base power is now around 1.05mW with low variance
                 channels.append(
                     {
                         "power": 1.05,  # mW
                         "energy": 0.0,  # Wh
-                        "cell_id": None,  # Initialize with no cell assigned
+                        "cell_id": None,
                     }
                 )
 
             self.plates.append(
                 {
                     "plate_id": f"plate-{plate_idx}",
-                    "reference_voltage": 3.3,  # Default reference voltage
+                    "reference_voltage": 3.3,
                     "channels": channels,
                 }
             )
+
+        # Initialize buffer database
+        self._init_buffer_db()
 
         # Initialize Zenoh session
         self.zenoh_session = None
         self.start_time = time.time()
 
+        # Initialize server heartbeat tracking
+        self.last_heartbeat = 0
+        self.heartbeat_lock = threading.Lock()
+
+        # Set up signal handlers for graceful shutdown
+        signal.signal(signal.SIGINT, self._handle_shutdown)
+        signal.signal(signal.SIGTERM, self._handle_shutdown)
+
+    def _handle_shutdown(self, signum, frame):
+        """Handle shutdown signals to ensure clean exit"""
+        logger.info(f"Received signal {signum}, shutting down gracefully...")
+        self.stopping = True
+
+    def _init_buffer_db(self):
+        """Initialize SQLite database for measurement buffering"""
+        db_exists = os.path.exists(BUFFER_DB_PATH)
+        self.conn = sqlite3.connect(BUFFER_DB_PATH, check_same_thread=False)
+        self.conn.execute(
+            "PRAGMA journal_mode=WAL"
+        )  # Use WAL mode for better concurrency
+        self.db_lock = threading.Lock()
+
+        if not db_exists:
+            with self.db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                CREATE TABLE measurements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TEXT NOT NULL,
+                    data TEXT NOT NULL,
+                    retry_count INTEGER DEFAULT 0,
+                    created_at INTEGER NOT NULL
+                )
+                """)
+                cursor.execute(
+                    "CREATE INDEX idx_created_at ON measurements(created_at)"
+                )
+                self.conn.commit()
+                logger.info(f"Created buffer database at {BUFFER_DB_PATH}")
+
+        # Count existing buffered measurements
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM measurements")
+            self.buffer_count = cursor.fetchone()[0]
+            logger.info(f"Found {self.buffer_count} existing buffered measurements")
+
     def connect_zenoh(self, config=None):
         """Connect to Zenoh network"""
         logger.info("Connecting to Zenoh network")
-        self.zenoh_session = zenoh.open(zenoh.Config() if config is None else config)
+        try:
+            self.zenoh_session = zenoh.open(
+                zenoh.Config() if config is None else config
+            )
 
-        # Initialize publisher for data
-        self.data_publisher = self.zenoh_session.declare_publisher(
-            f"measurement/node/{self.node_id}/data"
-        )
+            # Initialize publisher for data
+            self.data_publisher = self.zenoh_session.declare_publisher(
+                f"measurement/node/{self.node_id}/data"
+            )
 
-        # Subscribe to control messages
-        self.control_subscriber = self.zenoh_session.declare_subscriber(
-            f"measurement/node/{self.node_id}/control", self._handle_control_message
-        )
+            # Initialize subscriber for heartbeat messages
+            self.heartbeat_subscriber = self.zenoh_session.declare_subscriber(
+                "measurement/server/heartbeat", self._handle_heartbeat
+            )
 
-        logger.info(f"Node {self.node_id} connected to Zenoh")
+            # Subscribe to control messages
+            self.control_subscriber = self.zenoh_session.declare_subscriber(
+                f"measurement/node/{self.node_id}/control", self._handle_control_message
+            )
+
+            # Subscribe to acknowledgment messages (for buffer publishing)
+            self.ack_subscriber = self.zenoh_session.declare_subscriber(
+                f"measurement/server/ack/{self.node_id}", self._handle_server_ack
+            )
+
+            logger.info(f"Node {self.node_id} connected to Zenoh")
+
+            # Start publisher thread
+            self.publisher_thread = threading.Thread(
+                target=self._publisher_worker, daemon=True
+            )
+            self.publisher_thread.start()
+
+            # Start buffer processing thread
+            self.buffer_thread = threading.Thread(
+                target=self._process_buffer, daemon=True
+            )
+            self.buffer_thread.start()
+
+            # Start server checker thread
+            self.checker_thread = threading.Thread(
+                target=self._check_server_status, daemon=True
+            )
+            self.checker_thread.start()
+
+            # Check for initial server availability
+            self._check_server_connection()
+        except Exception as e:
+            logger.error(f"Failed to connect to Zenoh: {str(e)}")
+            raise
 
     def close(self):
-        """Close Zenoh session"""
+        """Close Zenoh session and database"""
+        self.stopping = True
+
+        # Wait for threads to finish
+        if hasattr(self, "publisher_thread"):
+            self.publisher_thread.join(timeout=2)
+        if hasattr(self, "buffer_thread"):
+            self.buffer_thread.join(timeout=2)
+        if hasattr(self, "checker_thread"):
+            self.checker_thread.join(timeout=2)
+
         if self.zenoh_session:
             self.zenoh_session.close()
             logger.info("Zenoh session closed")
 
+        if hasattr(self, "conn"):
+            self.conn.close()
+            logger.info("Database connection closed")
+
     def _update_environmental_data(self):
         """Simulate small changes in environmental data"""
-        self.env_data["temperature"] += np.random.normal(0, 0.05)  # Smaller changes
+        self.env_data["temperature"] += np.random.normal(0, 0.05)
         self.env_data["humidity"] += np.random.normal(0, 0.1)
         self.env_data["pressure"] += np.random.normal(0, 0.05)
 
@@ -102,17 +219,16 @@ class SimulatedNode:
 
             for channel in plate["channels"]:
                 # Generate power with Gaussian noise around 1.05mW
-                # Scale by reference voltage
                 base_power = 1.05 * voltage_factor
-                noise = np.random.normal(0, 0.01)  # Very low variance
+                noise = np.random.normal(0, 0.01)
                 power = base_power + noise
-                channel["power"] = max(0, power)  # Prevent negative power
+                channel["power"] = max(0, power)
 
-                # Update energy (Wh) - convert mW to W and divide by 3600 for Wh per second
+                # Update energy (Wh)
                 channel["energy"] += channel["power"] / 1000 / 3600
 
-    def _publish_data(self):
-        """Publish environmental and measurement data to Zenoh"""
+    def _prepare_data_payload(self):
+        """Prepare measurement data payload"""
         timestamp = self._format_timestamp()
 
         payload = {
@@ -142,36 +258,262 @@ class SimulatedNode:
                         "channel": idx,
                         "power_mW": round(channel["power"], 3),
                         "energy_Wh": round(channel["energy"], 6),
-                        "cell_id": channel[
-                            "cell_id"
-                        ],  # Include cell_id in published data
+                        "cell_id": channel["cell_id"],
                     }
                 )
 
             payload["data"]["plates"].append(plate_data)
 
-        # Send data via Zenoh
-        if self.zenoh_session:
-            self.data_publisher.put(json.dumps(payload))
-        else:
-            logger.error("Zenoh session not connected")
-            exit(1)
+        return payload, timestamp
+
+    def _publisher_worker(self):
+        """Worker thread to process the publishing queue"""
+        while not self.stopping:
+            try:
+                payload, is_buffered = self.publish_queue.get(timeout=1)
+
+                if self.server_online:
+                    try:
+                        if is_buffered:
+                            # Send buffered data to special topic
+                            publisher = self.zenoh_session.declare_publisher(
+                                f"measurement/node/{self.node_id}/buffered_data"
+                            )
+                            publisher.put(json.dumps(payload))
+                        else:
+                            # Send regular data
+                            self.data_publisher.put(json.dumps(payload))
+
+                        logger.debug(
+                            f"Published data: {'buffered' if is_buffered else 'live'}"
+                        )
+                        self.publish_queue.task_done()
+                    except Exception as e:
+                        logger.error(f"Failed to publish data: {str(e)}")
+                        # If not buffered data, add to buffer
+                        if not is_buffered:
+                            self._buffer_data(payload)
+                        self.publish_queue.task_done()
+                        # Connection might be down, check status
+                        self._check_server_connection()
+                else:
+                    # If not buffered data, add to buffer
+                    if not is_buffered:
+                        self._buffer_data(payload)
+                    self.publish_queue.task_done()
+            except Empty:
+                pass
+            except Exception as e:
+                logger.error(f"Error in publisher worker: {str(e)}")
+
+    def _check_server_status(self):
+        """Thread to periodically check server status"""
+        while not self.stopping:
+            try:
+                current_time = time.time()
+                with self.heartbeat_lock:
+                    server_timeout = current_time - self.last_heartbeat > SERVER_TIMEOUT
+
+                if self.server_online and server_timeout:
+                    # Server might be down
+                    logger.warning("Server heartbeat timeout, checking connection")
+                    self._check_server_connection()
+
+                # Check every second
+                time.sleep(1)
+            except Exception as e:
+                logger.error(f"Error checking server status: {str(e)}")
+
+    def _check_server_connection(self):
+        """Check if server is reachable by sending a ping"""
+        if not self.zenoh_session:
+            self.server_online = False
+            return
+
+        try:
+            # Send a ping message
+            ping_publisher = self.zenoh_session.declare_publisher(
+                f"measurement/node/{self.node_id}/ping"
+            )
+            ping_publisher.put(
+                json.dumps(
+                    {"node_id": self.node_id, "timestamp": self._format_timestamp()}
+                )
+            )
+
+            # Give server time to respond with heartbeat
+            time.sleep(SERVER_TIMEOUT)
+
+            # Check if heartbeat was received
+            with self.heartbeat_lock:
+                server_responsive = time.time() - self.last_heartbeat <= SERVER_TIMEOUT
+
+            if server_responsive:
+                if not self.server_online:
+                    logger.info("Server is back online")
+                    self.server_online = True
+            else:
+                if self.server_online:
+                    logger.warning("Server is offline, switching to buffering mode")
+                    self.server_online = False
+
+        except Exception as e:
+            logger.error(f"Error checking server connection: {str(e)}")
+            self.server_online = False
+
+    def _handle_heartbeat(self, sample):
+        """Process heartbeat message from server"""
+        try:
+            with self.heartbeat_lock:
+                self.last_heartbeat = time.time()
+                if not self.server_online:
+                    logger.info("Received server heartbeat, server is online")
+                    self.server_online = True
+        except Exception as e:
+            logger.error(f"Error processing heartbeat: {str(e)}")
+
+    def _handle_server_ack(self, sample):
+        """Handle acknowledgment from server for buffered data"""
+        try:
+            message = json.loads(sample.payload.to_string())
+            batch_id = message.get("batch_id")
+            success = message.get("success", False)
+
+            if batch_id and success:
+                # Delete acknowledged data from buffer
+                with self.db_lock:
+                    cursor = self.conn.cursor()
+                    ids = json.loads(batch_id)
+                    placeholders = ",".join("?" for _ in ids)
+                    cursor.execute(
+                        f"DELETE FROM measurements WHERE id IN ({placeholders})", ids
+                    )
+                    deleted_count = cursor.rowcount
+                    self.conn.commit()
+                    self.buffer_count -= deleted_count
+                    logger.info(
+                        f"Removed {deleted_count} acknowledged measurements from buffer"
+                    )
+        except Exception as e:
+            logger.error(f"Error processing server acknowledgment: {str(e)}")
+
+    def _buffer_data(self, payload):
+        """Store measurement data in the local buffer"""
+        if self.buffer_count >= MAX_BUFFER_SIZE:
+            # Buffer is full, remove oldest entries
+            with self.db_lock:
+                cursor = self.conn.cursor()
+                cursor.execute(
+                    "DELETE FROM measurements WHERE id IN (SELECT id FROM measurements ORDER BY created_at ASC LIMIT ?)",
+                    (BUFFER_BATCH_SIZE,),
+                )
+                deleted = cursor.rowcount
+                self.conn.commit()
+                self.buffer_count -= deleted
+                logger.warning(f"Buffer full, removed {deleted} oldest measurements")
+
+        # Insert the new measurement
+        with self.db_lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "INSERT INTO measurements (timestamp, data, created_at) VALUES (?, ?, ?)",
+                (payload.get("timestamp"), json.dumps(payload), int(time.time())),
+            )
+            self.conn.commit()
+            self.buffer_count += 1
+
+        if self.buffer_count % 100 == 0:
+            logger.info(f"Buffered {self.buffer_count} measurements (server offline)")
+
+    def _process_buffer(self):
+        """Process buffered measurements when server is back online"""
+        while not self.stopping:
+            try:
+                # Check if we should attempt to send buffered data
+                if (
+                    self.server_online
+                    and self.buffer_count > 0
+                    and not self.is_sending_buffer
+                ):
+                    self.is_sending_buffer = True
+                    logger.info(
+                        f"Starting to send {self.buffer_count} buffered measurements"
+                    )
+
+                    # Process in batches to avoid overwhelming the server
+                    sent_count = 0
+                    while (
+                        self.server_online
+                        and self.buffer_count > 0
+                        and not self.stopping
+                    ):
+                        # Get a batch of buffered measurements
+                        with self.db_lock:
+                            cursor = self.conn.cursor()
+                            cursor.execute(
+                                "SELECT id, timestamp, data FROM measurements ORDER BY created_at ASC LIMIT ?",
+                                (BUFFER_BATCH_SIZE,),
+                            )
+                            rows = cursor.fetchall()
+
+                        if not rows:
+                            break
+
+                        # Create batch to send
+                        batch_ids = []
+                        for row_id, timestamp, data_json in rows:
+                            try:
+                                data = json.loads(data_json)
+                                batch_ids.append(row_id)
+                                # Queue for sending
+                                self.publish_queue.put((data, True))
+                                sent_count += 1
+                            except json.JSONDecodeError:
+                                logger.error(
+                                    f"Invalid JSON in buffered data id {row_id}"
+                                )
+                                # Delete invalid data
+                                with self.db_lock:
+                                    self.conn.execute(
+                                        "DELETE FROM measurements WHERE id = ?",
+                                        (row_id,),
+                                    )
+                                    self.conn.commit()
+                                    self.buffer_count -= 1
+
+                        # Send batch ID list for acknowledgment
+                        if batch_ids:
+                            batch_meta_publisher = self.zenoh_session.declare_publisher(
+                                f"measurement/node/{self.node_id}/buffer_batch"
+                            )
+                            batch_meta_publisher.put(
+                                json.dumps(
+                                    {
+                                        "node_id": self.node_id,
+                                        "batch_id": json.dumps(batch_ids),
+                                        "count": len(batch_ids),
+                                        "timestamp": self._format_timestamp(),
+                                    }
+                                )
+                            )
+
+                            # Wait a bit before sending next batch to avoid overwhelming server
+                            time.sleep(1)
+
+                    logger.info(f"Sent {sent_count} buffered measurements")
+                    self.is_sending_buffer = False
+            except Exception as e:
+                logger.error(f"Error processing buffer: {str(e)}")
+                self.is_sending_buffer = False
+
+            # Check buffer every few seconds
+            time.sleep(RETRY_INTERVAL)
 
     def _handle_control_message(self, sample):
         """Handle incoming control messages"""
         try:
             message = json.loads(sample.payload.to_string())
             logger.info(f"Received control message: {message}")
-
-            # Parse timestamp if present
-            if "timestamp" in message:
-                try:
-                    message_time = self._parse_timestamp(message["timestamp"])
-                    logger.debug(f"Message timestamp: {message_time}")
-                except ValueError:
-                    logger.warning(
-                        f"Invalid timestamp format in message: {message['timestamp']}"
-                    )
 
             if message.get("action") == "set_reference_voltage":
                 plate_id = message.get("plate_id")
@@ -230,12 +572,10 @@ class SimulatedNode:
 
     def _set_reference_voltage(self, plate_id, voltage):
         """Set reference voltage for a specific plate"""
-        # Validate voltage is within acceptable range
         if not (1.0 <= voltage <= 5.0):
             logger.warning(f"Voltage {voltage}V out of acceptable range")
             return False
 
-        # Find the plate
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
                 logger.info(f"Setting reference voltage for {plate_id} to {voltage}V")
@@ -266,27 +606,21 @@ class SimulatedNode:
         """Get current time formatted as YYYY-MM-DD HH:MM:SS +ZZZZ"""
         return time.strftime("%Y-%m-%d %H:%M:%S %z")
 
-    def _parse_timestamp(self, timestamp_str):
-        """Parse a timestamp string in the format YYYY-MM-DD HH:MM:SS +ZZZZ"""
-        from datetime import datetime
-
-        return datetime.strptime(timestamp_str, "%Y-%m-%d %H:%M:%S %z")
-
     def run(self):
-        """Main simulation loop - publish data every second"""
+        """Main simulation loop"""
         logger.info(
-            f"Starting simulated node {self.node_id} with {self.num_plates} plates"
+            f"Starting buffered node {self.node_id} with {self.num_plates} plates"
         )
 
         try:
-            while True:
+            while not self.stopping:
                 # Update data
                 self._update_environmental_data()
                 self._update_plate_readings()
 
-                # Publish data every second
-                self._publish_data()
-                logger.debug(f"Published data for node {self.node_id}")
+                # Create payload and put in the publishing queue
+                payload, _ = self._prepare_data_payload()
+                self.publish_queue.put((payload, False))
 
                 # Wait for next second
                 time.sleep(1)
@@ -301,8 +635,8 @@ class SimulatedNode:
 
 def main():
     """Main function"""
-    # Create a simulated node
-    node = SimulatedNode(node_id=NODE_ID, num_plates=2)
+    # Create a buffered node
+    node = BufferedNode(node_id=NODE_ID, num_plates=2)
 
     # Connect to Zenoh
     node.connect_zenoh()
