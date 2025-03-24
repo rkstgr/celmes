@@ -8,7 +8,7 @@ import json
 import time
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Any, Optional
 import zenoh
 import psycopg2
@@ -82,12 +82,21 @@ class DataCollector:
         try:
             # Create tables if they don't exist
             cursor.execute("""
-            CREATE TABLE IF NOT EXISTS nodes (
+            CREATE TABLE IF NOT EXISTS node (
                 node_id TEXT PRIMARY KEY,
                 name TEXT,
                 location TEXT,
                 properties JSONB,
                 last_seen TIMESTAMP WITH TIME ZONE
+            )
+            """)
+
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cell (
+                cell_id TEXT PRIMARY KEY,
+                properties JSONB,
+                created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+                updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
             )
             """)
 
@@ -98,7 +107,7 @@ class DataCollector:
                 temperature FLOAT,
                 humidity FLOAT,
                 pressure FLOAT,
-                FOREIGN KEY (node_id) REFERENCES nodes (node_id)
+                FOREIGN KEY (node_id) REFERENCES node (node_id)
             )
             """)
 
@@ -108,7 +117,7 @@ class DataCollector:
                 node_id TEXT NOT NULL,
                 plate_id TEXT NOT NULL,
                 reference_voltage FLOAT,
-                FOREIGN KEY (node_id) REFERENCES nodes (node_id)
+                FOREIGN KEY (node_id) REFERENCES node (node_id)
             )
             """)
 
@@ -118,9 +127,32 @@ class DataCollector:
                 node_id TEXT NOT NULL,
                 plate_id TEXT NOT NULL,
                 channel INTEGER NOT NULL,
-                avg_power FLOAT,
-                energy FLOAT,
-                FOREIGN KEY (node_id) REFERENCES nodes (node_id)
+                cell_id TEXT NOT NULL,
+                power_mW FLOAT,
+                energy_Wh FLOAT,
+                FOREIGN KEY (node_id) REFERENCES node (node_id),
+                FOREIGN KEY (cell_id) REFERENCES cell (cell_id)
+            )
+            """)
+
+            # Ensure unconfigured cell exists
+            cursor.execute("""
+                INSERT INTO cell (cell_id, properties)
+                VALUES ('unconfigured', '{"type": "system", "description": "Default virtual cell for unassigned channels"}')
+                ON CONFLICT (cell_id) DO NOTHING
+            """)
+
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS path_cell_mapping (
+                id SERIAL PRIMARY KEY,
+                node_id TEXT NOT NULL,
+                plate_id TEXT NOT NULL,
+                channel INTEGER NOT NULL,
+                cell_id TEXT NOT NULL,
+                start_time TIMESTAMP WITH TIME ZONE NOT NULL,
+                end_time TIMESTAMP WITH TIME ZONE,
+                FOREIGN KEY (node_id) REFERENCES node (node_id),
+                FOREIGN KEY (cell_id) REFERENCES cell (cell_id)
             )
             """)
 
@@ -241,7 +273,7 @@ class DataCollector:
             logger.info(f"Data contains: {', '.join(data.keys())}")
 
             # Convert timestamp to datetime
-            dt = datetime.fromtimestamp(timestamp)
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S %z")
 
             # Ensure node exists in database
             self._ensure_node_exists(node_id)
@@ -277,7 +309,12 @@ class DataCollector:
             # Return list of known nodes
             nodes_list = list(self.nodes.values())
             query.reply(
-                json.dumps({"nodes": nodes_list, "timestamp": int(time.time())})
+                json.dumps(
+                    {
+                        "nodes": nodes_list,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S %z"),
+                    }
+                )
             )
         except Exception as e:
             logger.error(f"Error handling discovery query: {str(e)}")
@@ -292,11 +329,11 @@ class DataCollector:
             cursor = conn.cursor()
 
             # Check if node exists
-            cursor.execute("SELECT 1 FROM nodes WHERE node_id = %s", (node_id,))
+            cursor.execute("SELECT 1 FROM node WHERE node_id = %s", (node_id,))
             if not cursor.fetchone():
                 # Insert new node
                 cursor.execute(
-                    "INSERT INTO nodes (node_id, last_seen) VALUES (%s, NOW())",
+                    "INSERT INTO node (node_id, last_seen) VALUES (%s, NOW())",
                     (node_id,),
                 )
                 conn.commit()
@@ -321,7 +358,7 @@ class DataCollector:
             cursor = conn.cursor()
 
             cursor.execute(
-                "UPDATE nodes SET last_seen = %s WHERE node_id = %s",
+                "UPDATE node SET last_seen = %s WHERE node_id = %s",
                 (timestamp, node_id),
             )
 
@@ -377,7 +414,7 @@ class DataCollector:
     def _store_plate_data(self, node_id, timestamp, plates_data):
         """Store plate and channel data in TimescaleDB"""
         try:
-            logger.info(f"Connecting to DB to store plate data for node {node_id}")
+            logger.info(f"Processing plate data for node {node_id}")
             conn = self.connect_db()
             cursor = conn.cursor()
 
@@ -389,10 +426,6 @@ class DataCollector:
                 if not plate_id:
                     logger.warning("Skipping plate with missing plate_id")
                     continue
-
-                logger.info(
-                    f"Storing data for plate {plate_id} with ref voltage {ref_voltage}V"
-                )
 
                 # Store plate data
                 cursor.execute(
@@ -408,26 +441,96 @@ class DataCollector:
                 channels = plate.get("channels", [])
                 for channel_data in channels:
                     channel = channel_data.get("channel")
-                    avg_power = channel_data.get("avg_power")
-                    energy = channel_data.get("energy")
+                    power_mW = channel_data.get("power_mW")
+                    energy_Wh = channel_data.get("energy_Wh")
+
+                    # Combine check, insert (if needed), and get cell_id in one query
+                    cursor.execute(
+                        """
+                        WITH ensure_mapping AS (
+                            INSERT INTO path_cell_mapping
+                            (node_id, plate_id, channel, cell_id, start_time)
+                            VALUES (%s, %s, %s, 'unconfigured', %s)
+                            ON CONFLICT (node_id, plate_id, channel) 
+                            WHERE end_time IS NULL
+                            DO NOTHING
+                            RETURNING cell_id
+                        )
+                        SELECT cell_id 
+                        FROM path_cell_mapping
+                        WHERE node_id = %s AND plate_id = %s AND channel = %s
+                        AND start_time <= %s AND (end_time IS NULL OR end_time > %s)
+                        ORDER BY start_time DESC LIMIT 1
+                        """,
+                        (
+                            node_id,
+                            plate_id,
+                            channel,
+                            timestamp,  # for INSERT
+                            node_id,
+                            plate_id,
+                            channel,
+                            timestamp,
+                            timestamp,  # for SELECT
+                        ),
+                    )
+                    cell_id = cursor.fetchone()[0]
 
                     cursor.execute(
                         """
                         INSERT INTO channel_data
-                        (time, node_id, plate_id, channel, avg_power, energy)
-                        VALUES (%s, %s, %s, %s, %s, %s)
+                        (time, node_id, plate_id, channel, cell_id, power_mW, energy_Wh)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (timestamp, node_id, plate_id, channel, avg_power, energy),
+                        (
+                            timestamp,
+                            node_id,
+                            plate_id,
+                            channel,
+                            cell_id,
+                            power_mW,
+                            energy_Wh,
+                        ),
                     )
                     total_channels += 1
 
-            conn.commit()
+                conn.commit()
+
             logger.info(
-                f"Successfully stored data for {len(plates_data)} plates and {total_channels} channels from node {node_id}"
+                f"Stored data for {len(plates_data)} plates and {total_channels} channels from node {node_id}"
             )
 
         except Exception as e:
             logger.error(f"Error storing plate data: {str(e)}")
+        finally:
+            cursor.close()
+            conn.close()
+
+    def _get_cell_for_path(self, node_id, plate_id, channel, timestamp):
+        """Get the cell_id for a path at a specific time"""
+        try:
+            conn = self.connect_db()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                SELECT cell_id FROM path_cell_mapping
+            WHERE node_id = %s AND plate_id = %s AND channel = %s
+            AND start_time <= %s AND (end_time IS NULL OR end_time > %s)
+            ORDER BY start_time DESC LIMIT 1
+            """,
+                (node_id, plate_id, channel, timestamp, timestamp),
+            )
+
+            result = cursor.fetchone()
+            if result:
+                return result[0]
+            else:
+                # Return a placeholder or default "unconfigured" cell
+                return "unconfigured"
+        except Exception as e:
+            logger.error(f"Error getting cell for path: {str(e)}")
+            return "unconfigured"
         finally:
             cursor.close()
             conn.close()
@@ -441,7 +544,7 @@ class DataCollector:
             cursor.execute(
                 """
                 SELECT node_id, name, location, properties, last_seen
-                FROM nodes
+                FROM node
                 ORDER BY last_seen DESC
                 """
             )
@@ -471,7 +574,7 @@ class DataCollector:
 
             cursor.execute(
                 """
-                UPDATE nodes
+                UPDATE node
                 SET name = %s, location = %s, properties = %s
                 WHERE node_id = %s
                 """,
@@ -487,7 +590,7 @@ class DataCollector:
                 # Node doesn't exist yet
                 cursor.execute(
                     """
-                    INSERT INTO nodes (node_id, name, location, properties, last_seen)
+                    INSERT INTO node (node_id, name, location, properties, last_seen)
                     VALUES (%s, %s, %s, %s, NOW())
                     """,
                     (
@@ -540,6 +643,36 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Error sending control message: {str(e)}")
             return False
+
+    def reassign_path_to_cell(self, node_id, plate_id, channel, new_cell_id):
+        """Reassign a path to a new cell"""
+        now = datetime.now(timezone.utc)
+
+        conn = self.connect_db()
+        cursor = conn.cursor()
+
+        # End the current mapping
+        cursor.execute(
+            """
+            UPDATE path_cell_mapping
+            SET end_time = %s
+            WHERE node_id = %s AND plate_id = %s AND channel = %s
+            AND end_time IS NULL
+            """,
+            (now, node_id, plate_id, channel),
+        )
+
+        # Create the new mapping
+        cursor.execute(
+            """
+            INSERT INTO path_cell_mapping
+            (node_id, plate_id, channel, cell_id, start_time)
+            VALUES (%s, %s, %s, %s, %s)
+            """,
+            (node_id, plate_id, channel, new_cell_id, now),
+        )
+
+        conn.commit()
 
 
 @asynccontextmanager
@@ -713,7 +846,7 @@ async def get_power_data(
         cursor = conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
         query = """
-        SELECT time, plate_id, channel, avg_power, energy
+        SELECT time, plate_id, channel, power_mW, energy_Wh
         FROM channel_data
         WHERE node_id = %s
         """

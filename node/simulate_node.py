@@ -17,7 +17,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("SimNode")
 
-NODE_ID = "node-001"
+NODE_ID = "node-000"
 
 
 class SimulatedNode:
@@ -44,6 +44,7 @@ class SimulatedNode:
                     {
                         "power": 1.05,  # mW
                         "energy": 0.0,  # Wh
+                        "cell_id": None,  # Initialize with no cell assigned
                     }
                 )
 
@@ -139,8 +140,11 @@ class SimulatedNode:
                 plate_data["channels"].append(
                     {
                         "channel": idx,
-                        "avg_power": round(channel["power"], 3),
-                        "energy": round(channel["energy"], 6),
+                        "power_mW": round(channel["power"], 3),
+                        "energy_Wh": round(channel["energy"], 6),
+                        "cell_id": channel[
+                            "cell_id"
+                        ],  # Include cell_id in published data
                     }
                 )
 
@@ -193,6 +197,32 @@ class SimulatedNode:
                             )
                         )
 
+            elif message.get("action") == "assign_cell":
+                plate_id = message.get("plate_id")
+                channel = message.get("channel")
+                cell_id = message.get("cell_id")
+
+                if plate_id is not None and channel is not None and cell_id is not None:
+                    self._assign_cell(plate_id, channel, cell_id)
+
+                    # Send acknowledgment
+                    if self.zenoh_session:
+                        ack_publisher = self.zenoh_session.declare_publisher(
+                            f"measurement/node/{self.node_id}/ack"
+                        )
+                        ack_publisher.put(
+                            json.dumps(
+                                {
+                                    "action": "assign_cell",
+                                    "plate_id": plate_id,
+                                    "channel": channel,
+                                    "cell_id": cell_id,
+                                    "status": "success",
+                                    "timestamp": self._format_timestamp(),
+                                }
+                            )
+                        )
+
         except json.JSONDecodeError:
             logger.error("Failed to parse control message")
         except Exception as e:
@@ -211,6 +241,23 @@ class SimulatedNode:
                 logger.info(f"Setting reference voltage for {plate_id} to {voltage}V")
                 plate["reference_voltage"] = voltage
                 return True
+
+        logger.warning(f"Plate {plate_id} not found")
+        return False
+
+    def _assign_cell(self, plate_id, channel, cell_id):
+        """Assign a cell ID to a specific channel"""
+        for plate in self.plates:
+            if plate["plate_id"] == plate_id:
+                if 0 <= channel < len(plate["channels"]):
+                    logger.info(
+                        f"Assigning cell {cell_id} to {plate_id} channel {channel}"
+                    )
+                    plate["channels"][channel]["cell_id"] = cell_id
+                    return True
+                else:
+                    logger.warning(f"Invalid channel number {channel}")
+                    return False
 
         logger.warning(f"Plate {plate_id} not found")
         return False
@@ -255,7 +302,7 @@ class SimulatedNode:
 def main():
     """Main function"""
     # Create a simulated node
-    node = SimulatedNode(node_id=NODE_ID, num_plates=4)
+    node = SimulatedNode(node_id=NODE_ID, num_plates=2)
 
     # Connect to Zenoh
     node.connect_zenoh()
