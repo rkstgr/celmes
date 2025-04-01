@@ -1,2 +1,7 @@
 .venv
 __pycache__
+deployment/
+python_packages.tar.gz
+timescaledb-ha.tar
+grafana.tar
+*.db*

@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-Enhanced measurement node with local buffering for offline server scenarios
+generic_node.py
+Generic measurement node implementation with local buffering for offline server scenarios
 """
 
 import time
 import json
-import random
 import uuid
 import logging
-import numpy as np
-import zenoh
 import sqlite3
 import os
 import threading
 from datetime import datetime
 from queue import Queue, Empty
 import signal
+import abc
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger("BufferedNode")
+logger = logging.getLogger("GenericNode")
 
-NODE_ID = "node-000"
-BUFFER_DB_PATH = "measurement_buffer.db"
+# Constants
 MAX_BUFFER_SIZE = 100000  # Maximum number of measurements to buffer
 RETRY_INTERVAL = 10  # Seconds between retry attempts when server is offline
 SERVER_TIMEOUT = 5  # Seconds to wait for server response before considering it offline
@@ -32,12 +30,15 @@ RECONNECT_RETRIES = 3  # Number of retries before declaring server offline
 BUFFER_BATCH_SIZE = 50  # Number of buffered measurements to send in one batch
 
 
-class BufferedNode:
-    """Simulates a Raspberry Pi measurement node with offline buffering capability"""
+class GenericNode(abc.ABC):
+    """Generic measurement node with offline buffering capability"""
 
-    def __init__(self, node_id=None, num_plates=4):
+    def __init__(
+        self, node_id=None, num_plates=4, buffer_db_path="measurement_buffer.db"
+    ):
         self.node_id = node_id or f"node-{uuid.uuid4().hex[:8]}"
         self.num_plates = num_plates
+        self.buffer_db_path = buffer_db_path
         self.server_online = False
         self.publish_queue = Queue()
         self.buffer_count = 0
@@ -51,26 +52,8 @@ class BufferedNode:
             "pressure": 1013.0,  # hPa
         }
 
-        # Initialize simulated Pi-plates
+        # Initialize plates - to be populated by child classes
         self.plates = []
-        for plate_idx in range(num_plates):
-            channels = []
-            for channel_idx in range(7):
-                channels.append(
-                    {
-                        "power": 1.05,  # mW
-                        "energy": 0.0,  # Wh
-                        "cell_id": None,
-                    }
-                )
-
-            self.plates.append(
-                {
-                    "plate_id": f"plate-{plate_idx}",
-                    "reference_voltage": 3.3,
-                    "channels": channels,
-                }
-            )
 
         # Initialize buffer database
         self._init_buffer_db()
@@ -94,8 +77,8 @@ class BufferedNode:
 
     def _init_buffer_db(self):
         """Initialize SQLite database for measurement buffering"""
-        db_exists = os.path.exists(BUFFER_DB_PATH)
-        self.conn = sqlite3.connect(BUFFER_DB_PATH, check_same_thread=False)
+        db_exists = os.path.exists(self.buffer_db_path)
+        self.conn = sqlite3.connect(self.buffer_db_path, check_same_thread=False)
         self.conn.execute(
             "PRAGMA journal_mode=WAL"
         )  # Use WAL mode for better concurrency
@@ -117,7 +100,7 @@ class BufferedNode:
                     "CREATE INDEX idx_created_at ON measurements(created_at)"
                 )
                 self.conn.commit()
-                logger.info(f"Created buffer database at {BUFFER_DB_PATH}")
+                logger.info(f"Created buffer database at {self.buffer_db_path}")
 
         # Count existing buffered measurements
         with self.db_lock:
@@ -130,6 +113,8 @@ class BufferedNode:
         """Connect to Zenoh network"""
         logger.info("Connecting to Zenoh network")
         try:
+            import zenoh
+
             self.zenoh_session = zenoh.open(
                 zenoh.Config() if config is None else config
             )
@@ -200,32 +185,15 @@ class BufferedNode:
             self.conn.close()
             logger.info("Database connection closed")
 
+    @abc.abstractmethod
     def _update_environmental_data(self):
-        """Simulate small changes in environmental data"""
-        self.env_data["temperature"] += np.random.normal(0, 0.05)
-        self.env_data["humidity"] += np.random.normal(0, 0.1)
-        self.env_data["pressure"] += np.random.normal(0, 0.05)
+        """Update environmental data - to be implemented by child classes"""
+        pass
 
-        # Keep values in reasonable ranges
-        self.env_data["temperature"] = max(15, min(30, self.env_data["temperature"]))
-        self.env_data["humidity"] = max(30, min(70, self.env_data["humidity"]))
-        self.env_data["pressure"] = max(990, min(1030, self.env_data["pressure"]))
-
+    @abc.abstractmethod
     def _update_plate_readings(self):
-        """Update power and energy readings"""
-        for plate in self.plates:
-            ref_voltage = plate["reference_voltage"]
-            voltage_factor = ref_voltage / 3.3  # Scale with reference voltage
-
-            for channel in plate["channels"]:
-                # Generate power with Gaussian noise around 1.05mW
-                base_power = 1.05 * voltage_factor
-                noise = np.random.normal(0, 0.01)
-                power = base_power + noise
-                channel["power"] = max(0, power)
-
-                # Update energy (Wh)
-                channel["energy"] += channel["power"] / 1000 / 3600
+        """Update plate readings - to be implemented by child classes"""
+        pass
 
     def _prepare_data_payload(self):
         """Prepare measurement data payload"""
@@ -252,15 +220,27 @@ class BufferedNode:
                 "channels": [],
             }
 
+            # Add address if available (for hardware plates)
+            if "address" in plate:
+                plate_data["address"] = plate["address"]
+
             for idx, channel in enumerate(plate["channels"]):
-                plate_data["channels"].append(
-                    {
-                        "channel": idx,
-                        "power_mW": round(channel["power"], 3),
-                        "energy_Wh": round(channel["energy"], 6),
-                        "cell_id": channel["cell_id"],
-                    }
-                )
+                channel_data = {
+                    "channel": idx,
+                    "power_mW": round(channel["power"], 3),
+                    "energy_Wh": round(channel["energy"], 6),
+                    "cell_id": channel["cell_id"],
+                }
+
+                # Add voltage if available (for hardware readings)
+                if "voltage" in channel:
+                    channel_data["voltage"] = round(channel["voltage"], 4)
+
+                # Add timestamp if available (for hardware readings)
+                if "timestamp" in channel:
+                    channel_data["timestamp"] = channel["timestamp"]
+
+                plate_data["channels"].append(channel_data)
 
             payload["data"]["plates"].append(plate_data)
 
@@ -603,14 +583,12 @@ class BufferedNode:
         return False
 
     def _format_timestamp(self):
-        """Get current time formatted as YYYY-MM-DD HH:MM:SS +ZZZZ"""
-        return time.strftime("%Y-%m-%d %H:%M:%S %z")
+        """Get current time formatted as YYYY-MM-DD HH:MM:SS:MS +ZZZZ"""
+        return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S:%f %z")
 
     def run(self):
-        """Main simulation loop"""
-        logger.info(
-            f"Starting buffered node {self.node_id} with {self.num_plates} plates"
-        )
+        """Main operation loop"""
+        logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
 
         try:
             while not self.stopping:
@@ -626,24 +604,8 @@ class BufferedNode:
                 time.sleep(1)
 
         except KeyboardInterrupt:
-            logger.info("Simulation stopped by user")
+            logger.info("Node stopped by user")
         except Exception as e:
-            logger.error(f"Error in simulation: {str(e)}")
+            logger.error(f"Error in node operation: {str(e)}")
         finally:
             self.close()
-
-
-def main():
-    """Main function"""
-    # Create a buffered node
-    node = BufferedNode(node_id=NODE_ID, num_plates=2)
-
-    # Connect to Zenoh
-    node.connect_zenoh()
-
-    # Run the simulation
-    node.run()
-
-
-if __name__ == "__main__":
-    main()

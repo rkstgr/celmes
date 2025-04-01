@@ -1,13 +1,17 @@
 # CELMES
 
-Cell Measurement System.
+[CEL]l [ME]asurement [S]ystem.
 
-Distributed system of nodes with up two 8 * 7 cells, measuring voltage and energy.
+Measument system for REID cells.
 
-## Setup
+Current setup consists of one server and multiple nodes. Communication between nodes and server is done via Zenoh - an open source, high-performance, and low-latency communication middleware.
 
-Repo is structured into `/node`, `/server` `/gui`
+# Installation
 
-node: runs on each node, is responsible to talk with the pi plates and read the electronic signals
-server: there should only one in the network, hosting the database to which the nodes upload the measurement data
-gui: grafana frontend to visualize the time series data
+## Server
+
+Server is responsible for storing the measurement data in a time series database
+
+## Node
+
+Node is responsible for reading the electronic signals from the pi plates and publishing them on the network.

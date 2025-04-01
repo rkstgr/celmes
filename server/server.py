@@ -364,7 +364,7 @@ class DataCollector:
                 logger.warning(f"Invalid data payload from {node_id}")
                 return
 
-            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S %z")
+            dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S:%f %z")
             self._ensure_node_exists(node_id)
 
             if "environment" in data:
