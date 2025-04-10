@@ -15,6 +15,7 @@ from datetime import datetime
 from queue import Queue, Empty
 import signal
 import abc
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -44,12 +45,15 @@ class GenericNode(abc.ABC):
         self.buffer_count = 0
         self.is_sending_buffer = False
         self.stopping = False
+        self.array_size = 10
+        self.count = 0
+        self.i = 0
 
         # Initialize environmental sensors with starting values
         self.env_data = {
-            "temperature": 21.0,  # Celsius
-            "humidity": 45.0,  # %
-            "pressure": 1013.0,  # hPa
+            "temperature": np.zeros(self.array_size),  # Celsius
+            "humidity": np.zeros(self.array_size),  # %
+            "pressure": np.zeros(self.array_size),  # hPa
         }
 
         # Initialize plates - to be populated by child classes
@@ -110,14 +114,38 @@ class GenericNode(abc.ABC):
             logger.info(f"Found {self.buffer_count} existing buffered measurements")
 
     def connect_zenoh(self, config=None):
-        """Connect to Zenoh network"""
+        """Connect to Zenoh network by scanning the subnet for the server"""
+        import socket
+        import zenoh
+
+        def is_zenoh_server(ip, port=7447, timeout=0.2):
+            try:
+                with socket.create_connection((ip, port), timeout=timeout):
+                    return True
+            except Exception:
+                return False
+
+        def find_zenoh_server(subnet="192.168.42.", port=7447):
+            logger.info(f"🔍 Scanning {subnet}1–254 for Zenoh server on port {port}...")
+            for i in range(1, 255):
+                ip = f"{subnet}{i}"
+                if is_zenoh_server(ip, port):
+                    logger.info(f"✅ Found Zenoh server at {ip}:{port}")
+                    return ip
+            logger.error("❌ No Zenoh server found in subnet.")
+            return None
+
         logger.info("Connecting to Zenoh network")
         try:
-            import zenoh
+            if config is None:
+                config = zenoh.Config()
+                server_ip = find_zenoh_server("192.168.42.", 7447)
+                if server_ip is None:
+                    raise Exception("No Zenoh server found on the subnet.")
+                    return False
+                config.insert_json5("connect/endpoints", f'["tcp/{server_ip}:7447"]')
 
-            self.zenoh_session = zenoh.open(
-                zenoh.Config() if config is None else config
-            )
+            self.zenoh_session = zenoh.open(config)
 
             # Initialize publisher for data
             self.data_publisher = self.zenoh_session.declare_publisher(
@@ -165,6 +193,62 @@ class GenericNode(abc.ABC):
             logger.error(f"Failed to connect to Zenoh: {str(e)}")
             raise
 
+#     def connect_zenoh(self, config=None):
+#         """Connect to Zenoh network"""
+#         logger.info("Connecting to Zenoh network")
+#         try:
+#             import zenoh
+# 
+#             self.zenoh_session = zenoh.open(
+#                 zenoh.Config() if config is None else config
+#             )
+# 
+#             # Initialize publisher for data
+#             self.data_publisher = self.zenoh_session.declare_publisher(
+#                 f"measurement/node/{self.node_id}/data"
+#             )
+# 
+#             # Initialize subscriber for heartbeat messages
+#             self.heartbeat_subscriber = self.zenoh_session.declare_subscriber(
+#                 "measurement/server/heartbeat", self._handle_heartbeat
+#             )
+# 
+#             # Subscribe to control messages
+#             self.control_subscriber = self.zenoh_session.declare_subscriber(
+#                 f"measurement/node/{self.node_id}/control", self._handle_control_message
+#             )
+# 
+#             # Subscribe to acknowledgment messages (for buffer publishing)
+#             self.ack_subscriber = self.zenoh_session.declare_subscriber(
+#                 f"measurement/server/ack/{self.node_id}", self._handle_server_ack
+#             )
+# 
+#             logger.info(f"Node {self.node_id} connected to Zenoh")
+# 
+#             # Start publisher thread
+#             self.publisher_thread = threading.Thread(
+#                 target=self._publisher_worker, daemon=True
+#             )
+#             self.publisher_thread.start()
+# 
+#             # Start buffer processing thread
+#             self.buffer_thread = threading.Thread(
+#                 target=self._process_buffer, daemon=True
+#             )
+#             self.buffer_thread.start()
+# 
+#             # Start server checker thread
+#             self.checker_thread = threading.Thread(
+#                 target=self._check_server_status, daemon=True
+#             )
+#             self.checker_thread.start()
+# 
+#             # Check for initial server availability
+#             self._check_server_connection()
+#         except Exception as e:
+#             logger.error(f"Failed to connect to Zenoh: {str(e)}")
+#             raise
+
     def close(self):
         """Close Zenoh session and database"""
         self.stopping = True
@@ -204,9 +288,9 @@ class GenericNode(abc.ABC):
             "timestamp": timestamp,
             "data": {
                 "environment": {
-                    "temperature": round(self.env_data["temperature"], 2),
-                    "humidity": round(self.env_data["humidity"], 2),
-                    "pressure": round(self.env_data["pressure"], 2),
+                    "temperature": round(np.mean(self.env_data["temperature"]), 2),
+                    "humidity": round(np.mean(self.env_data["humidity"]), 2),
+                    "pressure": round(np.mean(self.env_data["pressure"]), 2),
                 },
                 "plates": [],
             },
@@ -225,16 +309,21 @@ class GenericNode(abc.ABC):
                 plate_data["address"] = plate["address"]
 
             for idx, channel in enumerate(plate["channels"]):
+                # skip the reference voltage channel
+                if idx == 0:
+                    continue;
+                # note that energy accumulates on a per-second basis
+                # whereas instantaneous power is an average over 10 seconds
                 channel_data = {
                     "channel": idx,
-                    "power_mW": round(channel["power"], 3),
+                    "power_mW": round(np.mean(channel["power"]), 3),
                     "energy_Wh": round(channel["energy"], 6),
                     "cell_id": channel["cell_id"],
                 }
 
                 # Add voltage if available (for hardware readings)
                 if "voltage" in channel:
-                    channel_data["voltage"] = round(channel["voltage"], 4)
+                    channel_data["voltage"] = round(np.mean(channel["voltage"]), 4)
 
                 # Add timestamp if available (for hardware readings)
                 if "timestamp" in channel:
@@ -552,7 +641,7 @@ class GenericNode(abc.ABC):
 
     def _set_reference_voltage(self, plate_id, voltage):
         """Set reference voltage for a specific plate"""
-        if not (1.0 <= voltage <= 5.0):
+        if not (0.5 <= voltage <= 2.0):
             logger.warning(f"Voltage {voltage}V out of acceptable range")
             return False
 
@@ -592,13 +681,18 @@ class GenericNode(abc.ABC):
 
         try:
             while not self.stopping:
-                # Update data
+                # Update data (order matters)
                 self._update_environmental_data()
                 self._update_plate_readings()
-
-                # Create payload and put in the publishing queue
-                payload, _ = self._prepare_data_payload()
-                self.publish_queue.put((payload, False))
+                
+                self.i += 1
+                self.count = min(self.count + 1, self.array_size)  # array not filled indicator
+                # Reset index to 0 after full cycle
+                if self.i == self.buffer_size:
+                    self.i = 0
+                    # Create payload and put in the publishing queue
+                    payload, _ = self._prepare_data_payload()
+                    self.publish_queue.put((payload, False))
 
                 # Wait for next second
                 time.sleep(1)

@@ -6,6 +6,7 @@ Implementation of a measurement node with DAQ hardware integration
 
 import logging
 import time
+import numpy as np
 from generic_node import GenericNode
 
 logger = logging.getLogger("DaqNode")
@@ -48,11 +49,12 @@ class DaqNode(GenericNode):
                 for channel_idx in range(8):  # DAQC2 has 8 channels (0-7)
                     channels.append(
                         {
-                            "power": 0.0,  # Will be calculated from voltage
-                            "energy": 0.0,  # Wh
+                            "power": np.zeros(self.array_size),  # Will be calculated from voltage
+                            "energy": 0.0,  # Wh tied to cell_id
                             "cell_id": None,
-                            "voltage": 0.0,  # Raw voltage reading
-                            "timestamp": self._format_timestamp(),
+                            "voltage": np.zeros(self.array_size),  # Raw voltage reading
+                            "timestamp": np.array([""] * self.array_size, dtype='<U40')  # 40 chars is safe for this format
+,
                         }
                     )
 
@@ -60,7 +62,7 @@ class DaqNode(GenericNode):
                     {
                         "plate_id": f"plate-{plate_idx}",
                         "address": plate_idx,
-                        "reference_voltage": 3.3,
+                        "target_voltage": 1.200,
                         "channels": channels,
                     }
                 )
@@ -94,14 +96,14 @@ class DaqNode(GenericNode):
             )
 
             # Update environmental data with real readings
-            self.env_data["temperature"] = sensor_data.temperature
-            self.env_data["pressure"] = sensor_data.pressure
-            self.env_data["humidity"] = sensor_data.humidity
+            self.env_data["temperature"][self.i] = sensor_data.temperature
+            self.env_data["pressure"][self.i] = sensor_data.pressure
+            self.env_data["humidity"][self.i] = sensor_data.humidity
 
             logger.debug(
-                f"BME280 readings - Temp: {self.env_data['temperature']:.1f}°C, "
-                f"Pressure: {self.env_data['pressure']:.1f}hPa, "
-                f"Humidity: {self.env_data['humidity']:.1f}%"
+                f"BME280 readings - Temp: {self.env_data['temperature'][i]:.1f}°C, "
+                f"Pressure: {self.env_data['pressure'][i]:.1f}hPa, "
+                f"Humidity: {self.env_data['humidity'][i]:.1f}%"
             )
 
         except Exception as e:
@@ -116,28 +118,43 @@ class DaqNode(GenericNode):
             for plate in self.plates:
                 plate_reading_start = time.time()
                 address = plate["address"]
-                ref_voltage = plate["reference_voltage"]
-
+                target_voltage = plate["target_voltage"]
+                
                 for idx, channel in enumerate(plate["channels"]):
                     try:
                         # Read voltage from DAQC2
                         voltage = DAQC2.getADC(address, idx)
-                        channel["voltage"] = voltage
-                        channel["timestamp"] = self._format_timestamp()
+                        channel["voltage"][self.i] = voltage
+                        channel["timestamp"][self.i] = self._format_timestamp()
+                        # channel 0 is always the reference voltage
+                        if idx == 0:
+                            ref_voltage = voltage
+                        else:
+                            # Calculate power in mW
+                            power = ((voltage - ref_voltage) / 22) * voltage * 1000
+                            channel["power"][self.i] = power
 
-                        # Calculate power (P = V²/R), assuming a resistor of 22Ω
-                        # Convert to mW: * 1000
-                        power = (voltage**2 / 22) * 1000  # V²/R * 1000 for mW
-                        channel["power"] = power
+                            # Compute trapezoidal energy if we have a previous entry
+                            prev_i = (self.i - 1) % self.array_size  #note: -1 % 10 = 9
+                            prev_power = channel["power"][prev_i]
+                            prev_timestamp_str = channel["timestamp"][prev_i]
+                            curr_timestamp_str = channel["timestamp"][self.i]
 
-                        # Update energy (Wh)
-                        # Convert mW to W (/1000) and then to Wh (/3600)
-                        channel["energy"] += (power / 1000) / 3600
+                            # Format: "2025-04-10 13:22:45:123456 +0200"
+                            time_format = "%Y-%m-%d %H:%M:%S:%f %z"
 
-                    except Exception as e:
-                        logger.error(
-                            f"Error reading channel {idx} on plate {address}: {str(e)}"
-                        )
+                            try:
+                                t1 = datetime.strptime(prev_timestamp_str, time_format)
+                                t2 = datetime.strptime(curr_timestamp_str, time_format)
+                                delta_seconds = (t2 - t1).total_seconds()
+
+                                # Trapezoidal rule energy integration
+                                avg_power_mW = (prev_power + power) / 2
+                                delta_energy_Wh = (avg_power_mW / 1000) * (delta_seconds / 3600)
+                                channel["energy"] += delta_energy_Wh
+
+                            except Exception as e:
+                                logger.warning(f"Could not parse timestamps for energy calc: {e}")
 
                 # Keep previous values on error
                 plate_reading_times.append(time.time() - plate_reading_start)
