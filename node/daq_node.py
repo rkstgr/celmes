@@ -7,6 +7,7 @@ Implementation of a measurement node with DAQ hardware integration
 import logging
 import time
 import numpy as np
+from datetime import datetime
 from generic_node import GenericNode
 
 logger = logging.getLogger("DaqNode")
@@ -41,7 +42,8 @@ class DaqNode(GenericNode):
         # Initialize DAQC2 plates
         self.daqc2_present = DAQC2.daqc2sPresent
         self.plates = []
-
+        initial_timestamp = self._format_timestamp()
+        
         # Only initialize plates that are actually present
         for plate_idx in range(8):  # DAQC2 supports addresses 0-7
             if self.daqc2_present[plate_idx] == 1:
@@ -53,8 +55,7 @@ class DaqNode(GenericNode):
                             "energy": 0.0,  # Wh tied to cell_id
                             "cell_id": None,
                             "voltage": np.zeros(self.array_size),  # Raw voltage reading
-                            "timestamp": np.array([""] * self.array_size, dtype='<U40')  # 40 chars is safe for this format
-,
+                            "timestamp": np.array([initial_timestamp] * self.array_size, dtype='<U40'),  # 40 chars is safe for this format
                         }
                     )
 
@@ -63,6 +64,7 @@ class DaqNode(GenericNode):
                         "plate_id": f"plate-{plate_idx}",
                         "address": plate_idx,
                         "target_voltage": 1.200,
+                        "bias_voltage": 0.5,  # Initial DAC bias voltage for BJT control
                         "channels": channels,
                     }
                 )
@@ -94,16 +96,15 @@ class DaqNode(GenericNode):
             sensor_data = bme280.sample(
                 self.i2c_bus, self.bme280_address, self.bme280_calibration
             )
-
             # Update environmental data with real readings
             self.env_data["temperature"][self.i] = sensor_data.temperature
             self.env_data["pressure"][self.i] = sensor_data.pressure
             self.env_data["humidity"][self.i] = sensor_data.humidity
 
             logger.debug(
-                f"BME280 readings - Temp: {self.env_data['temperature'][i]:.1f}°C, "
-                f"Pressure: {self.env_data['pressure'][i]:.1f}hPa, "
-                f"Humidity: {self.env_data['humidity'][i]:.1f}%"
+                f"BME280 readings - Temp: {self.env_data['temperature'][self.i]:.1f}°C, "
+                f"Pressure: {self.env_data['pressure'][self.i]:.1f}hPa, "
+                f"Humidity: {self.env_data['humidity'][self.i]:.1f}%"
             )
 
         except Exception as e:
@@ -118,16 +119,16 @@ class DaqNode(GenericNode):
             for plate in self.plates:
                 plate_reading_start = time.time()
                 address = plate["address"]
-                target_voltage = plate["target_voltage"]
                 
-                for idx, channel in enumerate(plate["channels"]):
+                for idx in reversed(range(len(plate["channels"]))):
                     try:
+                        channel = plate["channels"][idx]
                         # Read voltage from DAQC2
                         voltage = DAQC2.getADC(address, idx)
                         channel["voltage"][self.i] = voltage
                         channel["timestamp"][self.i] = self._format_timestamp()
-                        # channel 0 is always the reference voltage
-                        if idx == 0:
+                        # channel 7 is always the reference voltage
+                        if idx == 7:
                             ref_voltage = voltage
                         else:
                             # Calculate power in mW
@@ -152,10 +153,19 @@ class DaqNode(GenericNode):
                                 avg_power_mW = (prev_power + power) / 2
                                 delta_energy_Wh = (avg_power_mW / 1000) * (delta_seconds / 3600)
                                 channel["energy"] += delta_energy_Wh
+                                if idx == 1:
+                                    print(f"delta_seconds: {delta_seconds}", flush=True)
+                                    print(f"avg_power_mW: {avg_power_mW}", flush=True)
+                                    print(f"delta_energy_Wh: {delta_energy_Wh}", flush=True)
+                                    print(f"channel['energy']: {channel['energy']}", flush=True)
 
                             except Exception as e:
                                 logger.warning(f"Could not parse timestamps for energy calc: {e}")
 
+                    except Exception as e:
+                        logger.error(
+                            f"Error reading channel {idx} on plate {address}: {str(e)}"
+                        )
                 # Keep previous values on error
                 plate_reading_times.append(time.time() - plate_reading_start)
 
@@ -169,3 +179,38 @@ class DaqNode(GenericNode):
             logger.debug(
                 f"Plate reading times: [{', '.join([f'{t * 1000:.1f}ms' for t in plate_reading_times])}]"
             )
+            
+    def _update_reference_voltage(self):
+        """Update reference voltage by adjusting bias DAC output"""
+        
+        Kp = 0.2               # Proportional gain — tune this down to reduce reaction strength
+        max_step = 0.01        # Maximum allowed DAC change per update (V)
+        min_dac = 0.0          # Min DAC output (e.g., 0V)
+        max_dac = 4.095          # Max DAC output (e.g., 3.3V)
+
+        for plate in self.plates:
+            address = plate["address"]
+            target_voltage = plate["target_voltage"]
+
+            # Read the current reference voltage from buffer (averaged over last 10 seconds)
+            reference_voltage = np.mean(plate["channels"][7]["voltage"])
+
+            # Compute the error
+            error = target_voltage - reference_voltage
+
+            # Calculate bias correction step
+            step = Kp * error
+            step = np.clip(step, -max_step, max_step)
+
+            # Update the internal DAC bias (clamped to valid range)
+            previous_bias = plate.get("bias_voltage", 0.5)  # default starting point
+            new_bias = np.clip(previous_bias + step, min_dac, max_dac)
+
+            # Set DAC
+            DAQC2.setDAC(address, 0, new_bias)
+
+            # Store the updated value for next iteration
+            plate["bias_voltage"] = new_bias
+
+            logger.info(f"[Plate {address}] Ref={reference_voltage:.3f}V, Target={target_voltage:.3f}V, Bias set to {new_bias:.3f}V")
+

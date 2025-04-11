@@ -46,7 +46,6 @@ class GenericNode(abc.ABC):
         self.is_sending_buffer = False
         self.stopping = False
         self.array_size = 10
-        self.count = 0
         self.i = 0
 
         # Initialize environmental sensors with starting values
@@ -288,19 +287,20 @@ class GenericNode(abc.ABC):
             "timestamp": timestamp,
             "data": {
                 "environment": {
-                    "temperature": round(np.mean(self.env_data["temperature"]), 2),
-                    "humidity": round(np.mean(self.env_data["humidity"]), 2),
-                    "pressure": round(np.mean(self.env_data["pressure"]), 2),
+                    "temperature": float(round(np.mean(self.env_data["temperature"]), 2)),
+                    "humidity": float(round(np.mean(self.env_data["humidity"]), 2)),
+                    "pressure": float(round(np.mean(self.env_data["pressure"]), 2)),
                 },
                 "plates": [],
             },
         }
+        
 
         # Add plate data
         for plate in self.plates:
             plate_data = {
                 "plate_id": plate["plate_id"],
-                "reference_voltage": plate["reference_voltage"],
+                "reference_voltage": float(round(np.mean(plate["channels"][7]["voltage"]), 3)),
                 "channels": [],
             }
 
@@ -310,29 +310,30 @@ class GenericNode(abc.ABC):
 
             for idx, channel in enumerate(plate["channels"]):
                 # skip the reference voltage channel
-                if idx == 0:
+                if idx == 7:
                     continue;
                 # note that energy accumulates on a per-second basis
                 # whereas instantaneous power is an average over 10 seconds
                 channel_data = {
                     "channel": idx,
-                    "power_mW": round(np.mean(channel["power"]), 3),
-                    "energy_Wh": round(channel["energy"], 6),
+                    "power_mW": float(round(np.mean(channel["power"]), 3)),
+                    "energy_Wh": float(channel["energy"]),
                     "cell_id": channel["cell_id"],
                 }
 
                 # Add voltage if available (for hardware readings)
                 if "voltage" in channel:
-                    channel_data["voltage"] = round(np.mean(channel["voltage"]), 4)
+                    channel_data["voltage"] = float(round(np.mean(channel["voltage"]), 4))
 
                 # Add timestamp if available (for hardware readings)
                 if "timestamp" in channel:
-                    channel_data["timestamp"] = channel["timestamp"]
+                    channel_data["timestamp"] = str(channel["timestamp"][self.i - 1])  # self.i was incremented before this function
 
                 plate_data["channels"].append(channel_data)
 
             payload["data"]["plates"].append(plate_data)
-
+            
+            print(payload, flush=True)
         return payload, timestamp
 
     def _publisher_worker(self):
@@ -565,7 +566,6 @@ class GenericNode(abc.ABC):
                                     }
                                 )
                             )
-
                             # Wait a bit before sending next batch to avoid overwhelming server
                             time.sleep(1)
 
@@ -648,7 +648,7 @@ class GenericNode(abc.ABC):
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
                 logger.info(f"Setting reference voltage for {plate_id} to {voltage}V")
-                plate["reference_voltage"] = voltage
+                plate["target_voltage"] = voltage
                 return True
 
         logger.warning(f"Plate {plate_id} not found")
@@ -686,13 +686,13 @@ class GenericNode(abc.ABC):
                 self._update_plate_readings()
                 
                 self.i += 1
-                self.count = min(self.count + 1, self.array_size)  # array not filled indicator
                 # Reset index to 0 after full cycle
-                if self.i == self.buffer_size:
-                    self.i = 0
+                if self.i == self.array_size:
                     # Create payload and put in the publishing queue
                     payload, _ = self._prepare_data_payload()
                     self.publish_queue.put((payload, False))
+                    self._update_reference_voltage()
+                    self.i = 0
 
                 # Wait for next second
                 time.sleep(1)
