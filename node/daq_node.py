@@ -38,7 +38,6 @@ class DaqNode(GenericNode):
             raise RuntimeError(
                 "Hardware modules are not available, cannot initialize DaqNode"
             )
-
         # Initialize DAQC2 plates
         self.daqc2_present = DAQC2.daqc2sPresent
         self.plates = []

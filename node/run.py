@@ -85,7 +85,8 @@ def main():
 
         # Connect to Zenoh
         node.connect_zenoh()
-
+        # Load Last Session
+        node.load_last_session()
         # Run the node
         node.run()
 

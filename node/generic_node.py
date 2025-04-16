@@ -301,6 +301,7 @@ class GenericNode(abc.ABC):
             plate_data = {
                 "plate_id": plate["plate_id"],
                 "reference_voltage": float(round(np.mean(plate["channels"][7]["voltage"]), 3)),
+                "bias_voltage": float(round(plate["bias_voltage"], 3)),
                 "channels": [],
             }
 
@@ -586,10 +587,10 @@ class GenericNode(abc.ABC):
 
             if message.get("action") == "set_reference_voltage":
                 plate_id = message.get("plate_id")
-                new_voltage = message.get("value")
+                target_voltage = message.get("target_voltage")
 
-                if plate_id and new_voltage is not None:
-                    self._set_reference_voltage(plate_id, new_voltage)
+                if plate_id and target_voltage is not None:
+                    self._set_reference_voltage(plate_id, target_voltage)
 
                     # Send acknowledgment
                     if self.zenoh_session:
@@ -601,7 +602,7 @@ class GenericNode(abc.ABC):
                                 {
                                     "action": "set_reference_voltage",
                                     "plate_id": plate_id,
-                                    "value": new_voltage,
+                                    "target_voltage": target_voltage,
                                     "status": "success",
                                     "timestamp": self._format_timestamp(),
                                 }
@@ -612,9 +613,10 @@ class GenericNode(abc.ABC):
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
                 cell_id = message.get("cell_id")
+                energy = message.get("energy")
 
                 if plate_id is not None and channel is not None and cell_id is not None:
-                    self._assign_cell(plate_id, channel, cell_id)
+                    self._assign_cell(plate_id, channel, cell_id, energy)
 
                     # Send acknowledgment
                     if self.zenoh_session:
@@ -628,6 +630,7 @@ class GenericNode(abc.ABC):
                                     "plate_id": plate_id,
                                     "channel": channel,
                                     "cell_id": cell_id,
+                                    "energy": energy,
                                     "status": "success",
                                     "timestamp": self._format_timestamp(),
                                 }
@@ -639,22 +642,22 @@ class GenericNode(abc.ABC):
         except Exception as e:
             logger.error(f"Error handling control message: {str(e)}")
 
-    def _set_reference_voltage(self, plate_id, voltage):
+    def _set_reference_voltage(self, plate_id, target_voltage):
         """Set reference voltage for a specific plate"""
-        if not (0.5 <= voltage <= 2.0):
-            logger.warning(f"Voltage {voltage}V out of acceptable range")
+        if not (0.5 <= target_voltage <= 2.0):
+            logger.warning(f"Voltage {target_voltage}V out of acceptable range")
             return False
 
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
-                logger.info(f"Setting reference voltage for {plate_id} to {voltage}V")
-                plate["target_voltage"] = voltage
+                logger.info(f"Setting reference voltage for {plate_id} to {target_voltage}V")
+                plate["target_voltage"] = target_voltage
                 return True
 
         logger.warning(f"Plate {plate_id} not found")
         return False
 
-    def _assign_cell(self, plate_id, channel, cell_id):
+    def _assign_cell(self, plate_id, channel, cell_id, energy):
         """Assign a cell ID to a specific channel"""
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
@@ -663,6 +666,7 @@ class GenericNode(abc.ABC):
                         f"Assigning cell {cell_id} to {plate_id} channel {channel}"
                     )
                     plate["channels"][channel]["cell_id"] = cell_id
+                    plate["channels"][channel]["energy"] = energy
                     return True
                 else:
                     logger.warning(f"Invalid channel number {channel}")
@@ -675,6 +679,42 @@ class GenericNode(abc.ABC):
         """Get current time formatted as YYYY-MM-DD HH:MM:SS:MS +ZZZZ"""
         return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S:%f %z")
 
+    def load_last_session (self):
+        import requests
+
+    def load_last_session(self):
+        logger.info("🔄 Loading last session state from server via Zenoh...")
+
+        for plate in self.plates:
+            plate_id = plate["plate_id"]
+
+            for channel_idx, channel in enumerate(plate["channels"]):
+                if channel_idx == 7:
+                    continue
+                key = f"session/last/{self.node_id}/{plate_id}/{channel_idx}"
+                try:
+                    replies = self.zenoh_session.get(key, timeout=1500)  # timeout in ms
+
+                    for reply in replies:
+                        if reply.ok and reply.result:
+                            payload_bytes = bytes(reply.result.payload)
+                            payload = json.loads(payload_bytes.decode("utf-8"))
+
+                            channel["cell_id"] = payload.get("cell_id")
+                            channel["energy"] = float(payload.get("energy_Wh", 0.0))
+
+                            if channel_idx == 0:
+                                plate["target_voltage"] = float(payload.get("target_voltage", 1.2))
+                                plate["bias_voltage"] = float(payload.get("bias_voltage", 0.5))
+
+                            logger.info(f"🧠 Restored {plate_id}/ch{channel_idx}: {payload}")
+                        else:
+                            logger.warning(f"⚠️ Invalid or empty reply for {plate_id}/ch{channel_idx}")
+
+    
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to load session for {plate_id}/ch{channel_idx}: {str(e)}")
+            
     def run(self):
         """Main operation loop"""
         logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
