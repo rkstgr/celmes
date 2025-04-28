@@ -31,9 +31,9 @@ logger = logging.getLogger("MeasurementServer")
 # Database connection parameters
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "timescaledb")
-DB_USER = os.environ.get("DB_USER", "admin")
-DB_PASS = os.environ.get("DB_PASSWORD", "password")
+DB_NAME = os.environ.get("DB_NAME", "celmes")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASS = os.environ.get("DB_PASSWORD", "emaKqste56")
 
 
 class NodeConfig(BaseModel):
@@ -107,6 +107,7 @@ class DataCollector:
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS cell (
                 cell_id TEXT PRIMARY KEY,
+                volume FLOAT,
                 properties JSONB,
                 created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
@@ -140,6 +141,7 @@ class DataCollector:
                 node_id TEXT NOT NULL,
                 plate_id TEXT NOT NULL,
                 target_voltage FLOAT,
+                resistance FLOAT,
                 PRIMARY KEY (node_id, plate_id),
                 FOREIGN KEY (node_id) REFERENCES node (node_id)
             )
@@ -438,6 +440,7 @@ class DataCollector:
                 "cell_id": None,
                 "energy_Wh": 0.0,
                 "target_voltage": 1.2,
+                "resistance": 22.0,
                 "bias_voltage": 0.5,
             }
 
@@ -472,7 +475,45 @@ class DataCollector:
                 if row:
                     session_data["energy_Wh"] = float(row[0])
 
-            # You could expand to fetch target_voltage and bias_voltage from a config table later
+            # ✅ Get target_voltage from the plate table
+            cursor.execute(
+                """
+                SELECT target_voltage FROM plate
+                WHERE node_id = %s AND plate_id = %s
+                LIMIT 1
+                """,
+                (node_id, plate_id)
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                session_data["target_voltage"] = float(row[0])
+                
+            # ✅ Get resistance from the plate table
+            cursor.execute(
+                """
+                SELECT resistance FROM plate
+                WHERE node_id = %s AND plate_id = %s
+                LIMIT 1
+                """,
+                (node_id, plate_id)
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                session_data["resistance"] = float(row[0])
+
+            # ✅ Get latest bias_voltage from the plate_data time series
+            cursor.execute(
+                """
+                SELECT reference_voltage FROM plate_data
+                WHERE node_id = %s AND plate_id = %s
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                (node_id, plate_id)
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                session_data["bias_voltage"] = float(row[0])
 
             cursor.close()
 
@@ -603,21 +644,6 @@ class DataCollector:
                     power_mW = channel_data.get("power_mW")
                     energy_Wh = channel_data.get("energy_Wh")
                     reported_cell_id = channel_data.get("cell_id") or "unconfigured"
-
-                    # 🔐 Ensure the cell_id exists in the cell table
-                    cursor.execute(
-                        "SELECT 1 FROM cell WHERE cell_id = %s",
-                        (reported_cell_id,)
-                    )
-                    if not cursor.fetchone():
-                        logger.info(f"➕ Adding new cell_id to cell table: {reported_cell_id}")
-                        cursor.execute(
-                            """
-                            INSERT INTO cell (cell_id, properties)
-                            VALUES (%s, %s)
-                            """,
-                            (reported_cell_id, json.dumps({"source": "auto-created by node"})),
-                        )
 
                     # Get the current mapped cell_id for this path
                     current_cell_id = self.get_cell_for_path(
@@ -1015,6 +1041,7 @@ async def assign_cell_control(message: Dict[str, Any]):
         plate_id = message["plate_id"]
         channel = message["channel"]
         cell_id = message["cell_id"]
+        volume = message["volume"]
         energy_override = message.get("energy_wh", None)
 
         if energy_override is not None:
@@ -1049,6 +1076,39 @@ async def assign_cell_control(message: Dict[str, Any]):
                 logging.warning(f"⚠️ Could not retrieve energy for cell '{cell_id}': {db_err}")
                 latest_energy = 0.0
 
+        # 🔐 Ensure the cell_id exists in the cell table
+        try:
+            conn = collector.connect_db()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                INSERT INTO cell (cell_id, volume, properties)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (cell_id) DO NOTHING
+                RETURNING cell_id
+                """,
+                (cell_id, volume, json.dumps({"source": "auto-created by node"})),
+            )
+            inserted = cursor.fetchone()
+
+            if inserted:
+                logger.info(f"➕ Added new cell_id: '{cell_id}' with volume={volume}")
+            else:
+                cursor.execute(
+                    """
+                    UPDATE cell
+                    SET volume = %s,
+                        updated_at = NOW()
+                    WHERE cell_id = %s
+                    """,
+                    (volume, cell_id),
+                )
+                logger.info(f"✅ Updated cell_id: '{cell_id}' with new volume={volume}")
+
+        except Exception as db_err:
+            logging.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
+            
         # 📦 Send full control message to the node
         success = collector.send_control_message(
             node_id,
@@ -1143,6 +1203,72 @@ async def set_reference_voltage_control(message: Dict[str, Any]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
+@app.post("/api/control/set-resistance")
+async def set_resistance_control(message: Dict[str, Any]):
+    """
+    Send a 'set_resistance' control message to a specific node.
+    Also updates the resistance in the plate table.
+    Expected JSON:
+    {
+        "node_id": "node-abc123",
+        "plate_id": "plate_1",
+        "resistance": 1.20
+    }
+    """
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        node_id = message["node_id"]
+        plate_id = message["plate_id"]
+        resistance = float(message["resistance"])
+
+        if not (0.0 <= resistance <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="Resistor value must be between 0ohm and 100ohm"
+            )
+
+        # ✅ Update the resistance in plate table
+        try:
+            conn = collector.connect_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO plate (node_id, plate_id, resistance)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (node_id, plate_id)
+                DO UPDATE SET resistance = EXCLUDED.resistance
+            """, (node_id, plate_id, resistance))
+            conn.commit()
+            cursor.close()
+            logger.info(f"💾 Updated resistance for {node_id}/{plate_id} to {resistance}ohm")
+        except Exception as db_err:
+            logger.warning(f"⚠️ Failed to update plate table: {db_err}")
+
+        # ✅ Send the control message to the node
+        success = collector.send_control_message(
+            node_id,
+            action="set_resistance",
+            plate_id=plate_id,
+            resistance=resistance
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send set_resistance command"
+            )
+
+        return {"status": "success", "sent_to": node_id, "resistance": resistance}
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Voltage must be a float")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 # Run server when script is executed directly
 if __name__ == "__main__":
