@@ -504,7 +504,7 @@ class DataCollector:
             # ✅ Get latest bias_voltage from the plate_data time series
             cursor.execute(
                 """
-                SELECT reference_voltage FROM plate_data
+                SELECT bias_voltage FROM plate_data
                 WHERE node_id = %s AND plate_id = %s
                 ORDER BY time DESC
                 LIMIT 1
