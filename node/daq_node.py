@@ -63,6 +63,7 @@ class DaqNode(GenericNode):
                         "plate_id": f"plate-{plate_idx}",
                         "address": plate_idx,
                         "target_voltage": 1.200,
+                        "resistance": 22.0,
                         "bias_voltage": 0.5,  # Initial DAC bias voltage for BJT control
                         "channels": channels,
                     }
@@ -118,6 +119,7 @@ class DaqNode(GenericNode):
             for plate in self.plates:
                 plate_reading_start = time.time()
                 address = plate["address"]
+                resistance = plate["resistance"]
                 
                 for idx in reversed(range(len(plate["channels"]))):
                     try:
@@ -131,7 +133,7 @@ class DaqNode(GenericNode):
                             ref_voltage = voltage
                         else:
                             # Calculate power in mW
-                            power = ((voltage - ref_voltage) / 22) * voltage * 1000
+                            power = ((voltage - ref_voltage) / resistance) * voltage * 1000
                             channel["power"][self.i] = power
 
                             # Compute trapezoidal energy if we have a previous entry
@@ -143,6 +145,7 @@ class DaqNode(GenericNode):
                             # Format: "2025-04-10 13:22:45:123456 +0200"
                             time_format = "%Y-%m-%d %H:%M:%S:%f %z"
 
+                            print(f"voltages: {channel['voltage']}", flush=True)
                             try:
                                 t1 = datetime.strptime(prev_timestamp_str, time_format)
                                 t2 = datetime.strptime(curr_timestamp_str, time_format)
@@ -182,8 +185,8 @@ class DaqNode(GenericNode):
     def _update_reference_voltage(self):
         """Update reference voltage by adjusting bias DAC output"""
         
-        Kp = 0.2               # Proportional gain — tune this down to reduce reaction strength
-        max_step = 0.01        # Maximum allowed DAC change per update (V)
+        Kp = 0.3               # Proportional gain — tune this down to reduce reaction strength
+        max_step = 0.1        # Maximum allowed DAC change per update (V)
         min_dac = 0.0          # Min DAC output (e.g., 0V)
         max_dac = 4.095          # Max DAC output (e.g., 3.3V)
 

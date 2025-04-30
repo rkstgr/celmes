@@ -300,6 +300,8 @@ class GenericNode(abc.ABC):
         for plate in self.plates:
             plate_data = {
                 "plate_id": plate["plate_id"],
+                "target_voltage": plate["target_voltage"],
+                "resistance": plate["resistance"],
                 "reference_voltage": float(round(np.mean(plate["channels"][7]["voltage"]), 3)),
                 "bias_voltage": float(round(plate["bias_voltage"], 3)),
                 "channels": [],
@@ -609,6 +611,30 @@ class GenericNode(abc.ABC):
                             )
                         )
 
+            elif message.get("action") == "set_resistance":
+                plate_id = message.get("plate_id")
+                resistance = message.get("resistance")
+
+                if plate_id and resistance is not None:
+                    self._set_resistance(plate_id, resistance)
+
+                    # Send acknowledgment
+                    if self.zenoh_session:
+                        ack_publisher = self.zenoh_session.declare_publisher(
+                            f"measurement/node/{self.node_id}/ack"
+                        )
+                        ack_publisher.put(
+                            json.dumps(
+                                {
+                                    "action": "set_resistance",
+                                    "plate_id": plate_id,
+                                    "resistance": resistance,
+                                    "status": "success",
+                                    "timestamp": self._format_timestamp(),
+                                }
+                            )
+                        )
+                        
             elif message.get("action") == "assign_cell":
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
@@ -657,6 +683,21 @@ class GenericNode(abc.ABC):
         logger.warning(f"Plate {plate_id} not found")
         return False
 
+    def _set_resistance(self, plate_id, resistance):
+        """Set resistance for a specific plate"""
+        if not (0.0 <= resistance <= 100.0):
+            logger.warning(f"Resistance {resistance}ohm out of acceptable range")
+            return False
+
+        for plate in self.plates:
+            if plate["plate_id"] == plate_id:
+                logger.info(f"Setting resistance for {plate_id} to {resistance}ohm")
+                plate["resistance"] = resistance
+                return True
+
+        logger.warning(f"Plate {plate_id} not found")
+        return False
+    
     def _assign_cell(self, plate_id, channel, cell_id, energy):
         """Assign a cell ID to a specific channel"""
         for plate in self.plates:
@@ -705,6 +746,7 @@ class GenericNode(abc.ABC):
 
                             if channel_idx == 0:
                                 plate["target_voltage"] = float(payload.get("target_voltage", 1.2))
+                                plate["resistance"] = float(payload.get("resistance", 22.0))
                                 plate["bias_voltage"] = float(payload.get("bias_voltage", 0.5))
 
                             logger.info(f"🧠 Restored {plate_id}/ch{channel_idx}: {payload}")
