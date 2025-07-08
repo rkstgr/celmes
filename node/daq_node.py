@@ -10,6 +10,7 @@ import numpy as np
 from datetime import datetime
 from generic_node import GenericNode
 
+
 logger = logging.getLogger("DaqNode")
 
 # Try to import hardware modules
@@ -47,12 +48,15 @@ class DaqNode(GenericNode):
         for plate_idx in range(8):  # DAQC2 supports addresses 0-7
             if self.daqc2_present[plate_idx] == 1:
                 channels = []
+                DAQC2.setLED(plate_idx, 'blue')
+                time.sleep(0.2)
                 for channel_idx in range(8):  # DAQC2 has 8 channels (0-7)
                     channels.append(
                         {
                             "power": np.zeros(self.array_size),  # Will be calculated from voltage
                             "energy": 0.0,  # Wh tied to cell_id
                             "cell_id": None,
+                            "cal_resistance": 0.0,
                             "voltage": np.zeros(self.array_size),  # Raw voltage reading
                             "timestamp": np.array([initial_timestamp] * self.array_size, dtype='<U40'),  # 40 chars is safe for this format
                         }
@@ -68,7 +72,9 @@ class DaqNode(GenericNode):
                         "channels": channels,
                     }
                 )
-
+        for plate_idx in range(8):  # DAQC2 supports addresses 0-7
+            DAQC2.setLED(plate_idx, 'off')
+            
         logger.info(f"Initialized {len(self.plates)} DAQC2 plates")
 
         # Initialize BME280 sensor
@@ -155,11 +161,11 @@ class DaqNode(GenericNode):
                                 avg_power_mW = (prev_power + power) / 2
                                 delta_energy_Wh = (avg_power_mW / 1000) * (delta_seconds / 3600)
                                 channel["energy"] += delta_energy_Wh
-                                if idx == 1:
-                                    print(f"delta_seconds: {delta_seconds}", flush=True)
-                                    print(f"avg_power_mW: {avg_power_mW}", flush=True)
-                                    print(f"delta_energy_Wh: {delta_energy_Wh}", flush=True)
-                                    print(f"channel['energy']: {channel['energy']}", flush=True)
+#                                 if idx == 1:
+#                                     print(f"delta_seconds: {delta_seconds}", flush=True)
+#                                     print(f"avg_power_mW: {avg_power_mW}", flush=True)
+#                                     print(f"delta_energy_Wh: {delta_energy_Wh}", flush=True)
+#                                     print(f"channel['energy']: {channel['energy']}", flush=True)
 
                             except Exception as e:
                                 logger.warning(f"Could not parse timestamps for energy calc: {e}")
@@ -216,3 +222,43 @@ class DaqNode(GenericNode):
 
             logger.info(f"[Plate {address}] Ref={reference_voltage:.3f}V, Target={target_voltage:.3f}V, Bias set to {new_bias:.3f}V")
 
+    def _update_channel_calibration(self, plate_id, channel):
+        self.i = 0
+        count = 0
+        cal_varience = 1.0
+        reference_voltage = 0.0
+        stability_check = False
+        cal_resistance_array = np.zeros(self.array_size)
+        
+        for plate in self.plates:
+            if plate["plate_id"] == plate_id:
+                logger.info(f"Setting calibration resistance for {plate_id} and ch-{channel}")
+                plate["target_voltage"] = 1.0
+                while(True):
+                    self._update_plate_readings()
+                    if count > 10:
+                        self._update_reference_voltage()
+                        reference_voltage = np.mean(plate["channels"][7]["voltage"])
+                        if reference_voltage > (plate["target_voltage"] - 0.002) and reference_voltage < (plate["target_voltage"] + 0.002):
+                            channel_voltage = np.mean(plate["channels"][channel]["voltage"])
+                            cal_resistance_array[self.i] = (3.300 - channel_voltage) / ((channel_voltage - reference_voltage)/plate["resistance"])
+                            cal_resistance = np.mean(cal_resistance_array)
+                            cal_varience = np.var(cal_resistance_array)
+                            logger.info(f"avg_cal: {cal_resistance}, varience: {cal_varience}, array: {cal_resistance_array}")
+                    self.i += 1
+                    count += 1    
+                    # Reset index to 0 after full cycle
+                    if self.i == self.array_size:
+                        self.i = 0
+                        if reference_voltage > (plate["target_voltage"] - 0.002) and reference_voltage < (plate["target_voltage"] + 0.002):
+                            stability_check = True
+                    if stability_check and cal_varience < 0.010:
+                        return cal_resistance
+                    # 30 second timeout    
+                    if count > 100:
+                        logger.info(f"Stable calibration not found for plate_id: {plate_id} channel: {channel}")
+                        return None
+                    
+                    time.sleep(0.1)
+                    
+            

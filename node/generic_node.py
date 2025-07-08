@@ -47,6 +47,7 @@ class GenericNode(abc.ABC):
         self.stopping = False
         self.array_size = 10
         self.i = 0
+        self.calibration_running = False
 
         # Initialize environmental sensors with starting values
         self.env_data = {
@@ -336,7 +337,7 @@ class GenericNode(abc.ABC):
 
             payload["data"]["plates"].append(plate_data)
             
-            print(payload, flush=True)
+            #print(payload, flush=True)
         return payload, timestamp
 
     def _publisher_worker(self):
@@ -603,6 +604,7 @@ class GenericNode(abc.ABC):
                             json.dumps(
                                 {
                                     "action": "set_reference_voltage",
+                                    "node_id": self.node_id,
                                     "plate_id": plate_id,
                                     "target_voltage": target_voltage,
                                     "status": "success",
@@ -627,8 +629,35 @@ class GenericNode(abc.ABC):
                             json.dumps(
                                 {
                                     "action": "set_resistance",
+                                    "node_id": self.node_id,
                                     "plate_id": plate_id,
                                     "resistance": resistance,
+                                    "status": "success",
+                                    "timestamp": self._format_timestamp(),
+                                }
+                            )
+                        )
+                        
+            elif message.get("action") == "set_calibration":
+                plate_id = message.get("plate_id")
+                channel = message.get("channel")
+
+                if plate_id and channel is not None:
+                    cal_resistance = self._set_calibration(plate_id, channel)
+
+                    # Send acknowledgment
+                    if self.zenoh_session:
+                        ack_publisher = self.zenoh_session.declare_publisher(
+                            f"measurement/node/{self.node_id}/ack"
+                        )
+                        ack_publisher.put(
+                            json.dumps(
+                                {
+                                    "action": "set_calibration",
+                                    "node_id": self.node_id,
+                                    "plate_id": plate_id,
+                                    "channel": channel,
+                                    "cal_resistance": cal_resistance,
                                     "status": "success",
                                     "timestamp": self._format_timestamp(),
                                 }
@@ -653,6 +682,7 @@ class GenericNode(abc.ABC):
                             json.dumps(
                                 {
                                     "action": "assign_cell",
+                                    "node_id": self.node_id,
                                     "plate_id": plate_id,
                                     "channel": channel,
                                     "cell_id": cell_id,
@@ -695,6 +725,19 @@ class GenericNode(abc.ABC):
                 plate["resistance"] = resistance
                 return True
 
+        logger.warning(f"Plate {plate_id} not found")
+        return False
+    
+    def _set_calibration(self, plate_id, channel):
+        """Set calibration resistance for a specific plate and channel"""
+        for plate in self.plates:
+            if plate["plate_id"] == plate_id:
+                self.calibration_running = True
+                cal_resistance = self._update_channel_calibration(plate_id, channel)
+                plate["channels"][channel]["cal_resistance"] = cal_resistance
+                self.calibration_running = False
+                return True
+        
         logger.warning(f"Plate {plate_id} not found")
         return False
     
@@ -764,17 +807,18 @@ class GenericNode(abc.ABC):
         try:
             while not self.stopping:
                 # Update data (order matters)
-                self._update_environmental_data()
-                self._update_plate_readings()
-                
-                self.i += 1
-                # Reset index to 0 after full cycle
-                if self.i == self.array_size:
-                    # Create payload and put in the publishing queue
-                    payload, _ = self._prepare_data_payload()
-                    self.publish_queue.put((payload, False))
-                    self._update_reference_voltage()
-                    self.i = 0
+                if not self.calibration_running:
+                    self._update_environmental_data()
+                    self._update_plate_readings()
+                    
+                    self.i += 1
+                    # Reset index to 0 after full cycle
+                    if self.i == self.array_size:
+                        # Create payload and put in the publishing queue
+                        payload, _ = self._prepare_data_payload()
+                        self.publish_queue.put((payload, False))
+                        self._update_reference_voltage()
+                        self.i = 0
 
                 # Wait for next second
                 time.sleep(1)
