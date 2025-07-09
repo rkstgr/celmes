@@ -641,9 +641,11 @@ class GenericNode(abc.ABC):
             elif message.get("action") == "set_calibration":
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
+                target_voltage = message.get("target_voltage")
+                cal_voltage = message.get("cal_voltage")
 
                 if plate_id and channel is not None:
-                    cal_resistance = self._set_calibration(plate_id, channel)
+                    cal_resistance = self._set_calibration(plate_id, channel, target_voltage, cal_voltage)
 
                     # Send acknowledgment
                     if self.zenoh_session:
@@ -728,15 +730,15 @@ class GenericNode(abc.ABC):
         logger.warning(f"Plate {plate_id} not found")
         return False
     
-    def _set_calibration(self, plate_id, channel):
+    def _set_calibration(self, plate_id, channel, target_voltage, cal_voltage):
         """Set calibration resistance for a specific plate and channel"""
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
                 self.calibration_running = True
-                cal_resistance = self._update_channel_calibration(plate_id, channel)
+                cal_resistance = self._update_channel_calibration(plate_id, channel, target_voltage, cal_voltage)
                 plate["channels"][channel]["cal_resistance"] = cal_resistance
                 self.calibration_running = False
-                return True
+                return cal_resistance
         
         logger.warning(f"Plate {plate_id} not found")
         return False
@@ -786,6 +788,7 @@ class GenericNode(abc.ABC):
 
                             channel["cell_id"] = payload.get("cell_id")
                             channel["energy"] = float(payload.get("energy_Wh", 0.0))
+                            channel["cal_resistance"] = payload.get(f"ch{channel_idx}_cal_resistance")
 
                             if channel_idx == 0:
                                 plate["target_voltage"] = float(payload.get("target_voltage", 1.2))
