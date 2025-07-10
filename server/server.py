@@ -141,7 +141,14 @@ class DataCollector:
                 node_id TEXT NOT NULL,
                 plate_id TEXT NOT NULL,
                 target_voltage FLOAT,
-                resistance FLOAT,
+                resistance FLOAT DEFAULT 22.0,
+                ch0_cal_resistance FLOAT DEFAULT 0.0,
+                ch1_cal_resistance FLOAT DEFAULT 0.0,
+                ch2_cal_resistance FLOAT DEFAULT 0.0,
+                ch3_cal_resistance FLOAT DEFAULT 0.0,
+                ch4_cal_resistance FLOAT DEFAULT 0.0,
+                ch5_cal_resistance FLOAT DEFAULT 0.0,
+                ch6_cal_resistance FLOAT DEFAULT 0.0,
                 PRIMARY KEY (node_id, plate_id),
                 FOREIGN KEY (node_id) REFERENCES node (node_id)
             )
@@ -278,6 +285,12 @@ class DataCollector:
                 self._handle_session_query
             )
             
+            # Subscribe to calibration_done acknowledgments from nodes
+            self.ack_subscriber = self.zenoh_session.declare_subscriber(
+                "measurement/node/*/ack",
+                self._handle_ack
+            )
+
             logger.info("Data collection started - Zenoh ready")
 
         except Exception as e:
@@ -285,6 +298,44 @@ class DataCollector:
             logger.error(f"Failed to start collection: {str(e)}")
             raise
 
+    def stop_collecting(self):
+        """Stop collecting data"""
+        if not self.running:
+            return
+
+        self.running = False
+
+        # Stop heartbeat thread
+        if hasattr(self, "heartbeat_thread"):
+            self.heartbeat_thread.join(timeout=2)
+            
+        # Undeclare all Zenoh resources
+        try:
+            if hasattr(self, "subscriber"):
+                self.subscriber.undeclare()
+            if hasattr(self, "buffered_subscriber"):
+                self.buffered_subscriber.undeclare()
+            if hasattr(self, "batch_subscriber"):
+                self.batch_subscriber.undeclare()
+            if hasattr(self, "ping_subscriber"):
+                self.ping_subscriber.undeclare()
+            if hasattr(self, "heartbeat_publisher"):
+                self.heartbeat_publisher.undeclare()
+            if hasattr(self, "discovery_queryable"):
+                self.discovery_queryable.undeclare()
+            if hasattr(self, "session_queryable"):
+                self.session_queryable.undeclare()
+            if hasattr(self, "ack_subscriber"):
+                self.ack_subscriber.undeclare()
+        except Exception as e:
+            logger.warning(f"⚠️ Error during Zenoh resource cleanup: {e}")
+
+        if self.zenoh_session:
+            self.zenoh_session.close()
+            logger.info("Zenoh session closed")
+
+        self.close_db()  # Close database connection when stopping
+        
     def _send_heartbeats(self):
         """Send periodic heartbeats to let nodes know the server is online"""
         while self.running:
@@ -354,23 +405,6 @@ class DataCollector:
                 )
         except Exception as e:
             logger.error(f"Error handling buffer batch: {str(e)}")
-
-    def stop_collecting(self):
-        """Stop collecting data"""
-        if not self.running:
-            return
-
-        self.running = False
-
-        # Stop heartbeat thread
-        if hasattr(self, "heartbeat_thread"):
-            self.heartbeat_thread.join(timeout=2)
-
-        if self.zenoh_session:
-            self.zenoh_session.close()
-            logger.info("Zenoh session closed")
-
-        self.close_db()  # Close database connection when stopping
 
     def _handle_data(self, sample):
         """Process incoming data from nodes"""
@@ -442,6 +476,13 @@ class DataCollector:
                 "target_voltage": 1.2,
                 "resistance": 22.0,
                 "bias_voltage": 0.5,
+                "ch0_cal_resistance": 0.0,
+                "ch1_cal_resistance": 0.0,
+                "ch2_cal_resistance": 0.0,
+                "ch3_cal_resistance": 0.0,
+                "ch4_cal_resistance": 0.0,
+                "ch5_cal_resistance": 0.0,
+                "ch6_cal_resistance": 0.0,
             }
 
             cursor = self.connect_db().cursor()
@@ -488,18 +529,26 @@ class DataCollector:
             if row and row[0] is not None:
                 session_data["target_voltage"] = float(row[0])
                 
-            # ✅ Get resistance from the plate table
+            # ✅ Get resistance and chX_cal_resistances from the plate table
             cursor.execute(
                 """
-                SELECT resistance FROM plate
+                SELECT resistance,
+                       ch0_cal_resistance, ch1_cal_resistance, ch2_cal_resistance,
+                       ch3_cal_resistance, ch4_cal_resistance, ch5_cal_resistance, ch6_cal_resistance
+                FROM plate
                 WHERE node_id = %s AND plate_id = %s
                 LIMIT 1
                 """,
                 (node_id, plate_id)
             )
             row = cursor.fetchone()
-            if row and row[0] is not None:
-                session_data["resistance"] = float(row[0])
+            if row:
+                if row[0] is not None:
+                    session_data["resistance"] = float(row[0])
+                for i in range(7):
+                    col_value = row[i + 1]  # row[1] to row[7]
+                    if col_value is not None:
+                        session_data[f"ch{i}_cal_resistance"] = float(col_value)
 
             # ✅ Get latest bias_voltage from the plate_data time series
             cursor.execute(
@@ -531,6 +580,43 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Failed to handle session query {query.key_expr}: {str(e)}")
 
+    def _handle_ack(self, sample):
+        """Handle acknowledgment messages from node and update respective database tables"""
+        try:
+            message = json.loads(sample.payload.to_string())
+            
+            action = message.get("action")
+            node_id = message.get("node_id")
+            plate_id = message.get("plate_id")
+            
+            if action == "set_calibration":
+                channel = message.get("channel")
+                cal_resistance = message.get("cal_resistance")
+
+                if not all([node_id, plate_id, channel is not None, cal_resistance is not None]):
+                    logger.warning("⚠️ Incomplete calibration message, ignoring.")
+                    return
+
+                column_name = f"ch{channel}_cal_resistance"
+                conn = self.connect_db()
+                cursor = conn.cursor()
+
+                sql = f"""
+                    INSERT INTO plate (node_id, plate_id, {column_name})
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (node_id, plate_id)
+                    DO UPDATE SET {column_name} = EXCLUDED.{column_name}
+                """
+                cursor.execute(sql, (node_id, plate_id, cal_resistance))
+                conn.commit()
+                cursor.close()
+
+                logger.info(f"✅ Calibration complete: Updated {node_id}/{plate_id}/ch-{channel} to {cal_resistance} Ω")
+            else:
+                logger.info(f"✅ Got Acknowledgment Message from {node_id}/{plate_id} for {action}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to handle calibration_done message: {e}")
 
     def _ensure_node_exists(self, node_id):
         """Make sure the node exists in the database"""
@@ -589,23 +675,27 @@ class DataCollector:
             temperature = env_data.get("temperature")
             humidity = env_data.get("humidity")
             pressure = env_data.get("pressure")
+            if temperature == 0.0 and humidity == 0.0 and pressure == 0.0:
+                logger.info(
+                    f"Env Sensor not connected to {node_id}, Env data not saved"
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO environmental_data 
+                    (time, node_id, temperature, humidity, pressure)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        timestamp,
+                        node_id,
+                        temperature,
+                        humidity,
+                        pressure,
+                    ),
+                )
 
-            cursor.execute(
-                """
-                INSERT INTO environmental_data 
-                (time, node_id, temperature, humidity, pressure)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    timestamp,
-                    node_id,
-                    temperature,
-                    humidity,
-                    pressure,
-                ),
-            )
-
-            self.db_conn.commit()
+                self.db_conn.commit()
 
         except Exception as e:
             logger.error(f"Error storing environmental data: {str(e)}")
@@ -1270,6 +1360,58 @@ async def set_resistance_control(message: Dict[str, Any]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
+@app.post("/api/control/set-calibration")
+async def set_calibration_control(message: Dict[str, Any]):
+    """
+    Send a 'set_calibration' control message to a specific node.
+    Also updates the chx_cal_resistance in the plate table.
+    Expected JSON:
+    {
+        "node_id": "node-abc123",
+        "plate_id": "plate_1",
+        "channel": "0"
+        "targe_voltage": 1.0,
+        "cal_voltage": 2.2
+    }
+    """
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        node_id = message["node_id"]
+        plate_id = message["plate_id"]
+        channel = message["channel"]
+        target_voltage = message["target_voltage"]
+        cal_voltage = message["cal_voltage"]
+
+
+        # ✅ Send the control message to the node
+        success = collector.send_control_message(
+            node_id,
+            action = "set_calibration",
+            plate_id = plate_id,
+            channel = channel,
+            target_voltage = target_voltage,
+            cal_voltage = cal_voltage
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send set_calibration command"
+            )
+
+        return {"status": "success", "sent_to": node_id, "plate_id": plate_id, "channel": channel}
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Voltage must be a float")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+    
 # Run server when script is executed directly
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
