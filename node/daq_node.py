@@ -236,6 +236,7 @@ class DaqNode(GenericNode):
         
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
+                DAQC2.setLED(plate["address"], 'red')
                 logger.info(f"Setting calibration resistance for {plate_id} and ch-{channel} with target_voltage: {target_voltage} and cal_voltage: {cal_voltage}")
                 plate["target_voltage"] = target_voltage
                 while(True):
@@ -260,8 +261,8 @@ class DaqNode(GenericNode):
                             cal_varience = np.var(cal_resistance_array)
                             if cal_varience > 0.1:
                                 DAQC2.setLED(plate["address"], 'red')
-                            elif cal_varience > 0.05:
-                                DAQC2.setLED(plate["address"], 'yellow')
+                            elif cal_varience > 0.08:
+                                DAQC2.setLED(plate["address"], 'magenta')
                             elif cal_varience > 0.02:
                                 DAQC2.setLED(plate["address"], 'green')
 
