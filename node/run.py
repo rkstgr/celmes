@@ -29,7 +29,7 @@ def main():
     )
     parser.add_argument("--node-id", default=None, help="Custom node ID")
     parser.add_argument(
-        "--num-plates", type=int, default=2, help="Number of plates to use/simulate"
+        "--num-plates", type=int, default=8, help="Number of plates to use/simulate"
     )
     parser.add_argument("--db-path", default=None, help="Path for the buffer database")
     parser.add_argument(

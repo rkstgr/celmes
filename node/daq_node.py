@@ -31,7 +31,7 @@ class DaqNode(GenericNode):
     """Implementation of a measurement node that collects data from real hardware"""
 
     def __init__(
-        self, node_id="node-001", num_plates=4, buffer_db_path="measurement_buffer.db"
+        self, node_id="node-001", num_plates=8, buffer_db_path="measurement_buffer.db"
     ):
         super().__init__(node_id, num_plates, buffer_db_path)
 
@@ -47,6 +47,7 @@ class DaqNode(GenericNode):
         # Only initialize plates that are actually present
         for plate_idx in range(8):  # DAQC2 supports addresses 0-7
             if self.daqc2_present[plate_idx] == 1:
+                self.print_plate_calibration(plate_idx)
                 channels = []
                 DAQC2.setLED(plate_idx, 'blue')
                 DAQC2.setDOUTall(plate_idx, 0x00)
@@ -74,7 +75,8 @@ class DaqNode(GenericNode):
                     }
                 )
         for plate_idx in range(8):  # DAQC2 supports addresses 0-7
-            DAQC2.setLED(plate_idx, 'off')
+            if self.daqc2_present[plate_idx] == 1:
+                DAQC2.setLED(plate_idx, 'off')
             
         logger.info(f"Initialized {len(self.plates)} DAQC2 plates")
 
@@ -152,8 +154,8 @@ class DaqNode(GenericNode):
                             # Format: "2025-04-10 13:22:45:123456 +0200"
                             time_format = "%Y-%m-%d %H:%M:%S:%f %z"
 
-#                             if address == 0:
-#                                 print(f"ch-{idx}, voltages: {channel['voltage']}", flush=True)
+                            if address == 4:
+                                print(f"ch-{idx}, voltages: {channel['voltage']}", flush=True)
 
                             try:
                                 t1 = datetime.strptime(prev_timestamp_str, time_format)
@@ -175,7 +177,7 @@ class DaqNode(GenericNode):
 
                     except Exception as e:
                         logger.error(
-                            f"Error reading channel {idx} on plate {address}: {str(e)}"
+                            f"Error reading channel {idx} on plate {address} with self.i={self.i}: {str(e)}"
                         )
                 # Keep previous values on error
                 plate_reading_times.append(time.time() - plate_reading_start)
@@ -190,7 +192,16 @@ class DaqNode(GenericNode):
             logger.debug(
                 f"Plate reading times: [{', '.join([f'{t * 1000:.1f}ms' for t in plate_reading_times])}]"
             )
-            
+    def _update_single_plate_readings(self, address, ch):
+        # update reference channel
+        voltage = DAQC2.getADC(address, 7)
+        self.plates[address]["channels"][7]["voltage"][self.i] = voltage
+        self.plates[address]["channels"][7]["timestamp"][self.i] = self._format_timestamp()
+        # update selected channel
+        voltage = DAQC2.getADC(address, ch)
+        self.plates[address]["channels"][ch]["voltage"][self.i] = voltage
+        self.plates[address]["channels"][ch]["timestamp"][self.i] = self._format_timestamp()
+        
     def _update_reference_voltage(self):
         """Update reference voltage by adjusting bias DAC output"""
         
@@ -222,7 +233,7 @@ class DaqNode(GenericNode):
 
             # Store the updated value for next iteration
             plate["bias_voltage"] = new_bias
-#             if address == 0:
+#             if address == 4:
 #                 logger.info(f"[Plate {address}] Ref={reference_voltage:.3f}V, Target={target_voltage:.3f}V, Bias set to {new_bias:.3f}V")
 
     def _update_channel_calibration(self, plate_id, channel, target_voltage, cal_voltage):
@@ -241,7 +252,7 @@ class DaqNode(GenericNode):
                 plate["target_voltage"] = target_voltage
                 while(True):
                     DAQC2.toggleDOUTbit(plate["address"], channel)
-                    self._update_plate_readings()
+                    self._update_single_plate_readings(plate["address"], channel)
                     
                     if count > 10:
                         if count == 11:
@@ -250,7 +261,7 @@ class DaqNode(GenericNode):
                         self._update_reference_voltage()
                         reference_voltage = np.mean(plate["channels"][7]["voltage"])
                         
-                        if reference_voltage > (plate["target_voltage"] - 0.002) and reference_voltage < (plate["target_voltage"] + 0.002):
+                        if reference_voltage > (plate["target_voltage"] - 0.0002) and reference_voltage < (plate["target_voltage"] + 0.0002):
                             if info_msg_flag:
                                 logger.info(f"Reference Voltage Stabilized, Calculating Calibration Resistance...")
                                 info_msg_flag = False
@@ -261,9 +272,9 @@ class DaqNode(GenericNode):
                             cal_varience = np.var(cal_resistance_array)
                             if cal_varience > 0.1:
                                 DAQC2.setLED(plate["address"], 'red')
-                            elif cal_varience > 0.08:
+                            elif cal_varience < 0.08:
                                 DAQC2.setLED(plate["address"], 'magenta')
-                            elif cal_varience > 0.02:
+                            elif cal_varience < 0.0025:
                                 DAQC2.setLED(plate["address"], 'green')
 
                             logger.info(f"avg_cal: {cal_resistance}, varience: {cal_varience}")
@@ -273,20 +284,26 @@ class DaqNode(GenericNode):
                     # Reset index to 0 after full cycle
                     if self.i == self.array_size:
                         self.i = 0
-                        if reference_voltage > (plate["target_voltage"] - 0.002) and reference_voltage < (plate["target_voltage"] + 0.002):
+                        if reference_voltage > (plate["target_voltage"] - 0.0002) and reference_voltage < (plate["target_voltage"] + 0.0002):
                             stability_check = True
-                    if stability_check and cal_varience < 0.005:
+                    if stability_check and cal_varience < 0.0001:
+                        logger.info(f"cal_resistance_array: {cal_resistance_array}")
                         logger.info(f"SUCCESS!!! Stable calibration found for plate_id: {plate_id} channel: {channel}")
                         DAQC2.clrDOUTbit(plate["address"], channel)
                         DAQC2.setLED(plate["address"], 'off')
                         return cal_resistance
                     # 30 second timeout    
-                    if count > 100:
+                    if count > 500:
                         DAQC2.clrDOUTbit(plate["address"], channel)
                         DAQC2.setLED(plate["address"], 'off')
                         logger.info(f"Stable calibration not found for plate_id: {plate_id} channel: {channel}")
-                        return None
+                        return 0.0
                     
-                    time.sleep(0.1)
+                    time.sleep(0.05)
                     
+    def print_plate_calibration(self, addr):
+        calibration_array = list()
+        for ptr in range(0, 256):
+            calibration_array.append(DAQC2.CalGetByte(addr, ptr))
             
+        print(f"Plate-{addr} Calibration Values: \n{calibration_array}\n\n")
