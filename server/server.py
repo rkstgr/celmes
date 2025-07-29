@@ -29,11 +29,26 @@ logging.basicConfig(
 logger = logging.getLogger("MeasurementServer")
 
 # Database connection parameters
-DB_HOST = os.environ.get("DB_HOST", "localhost")
-DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "celmes")
-DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASS = os.environ.get("DB_PASSWORD", "emaKqste56")
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = os.environ.get("DB_PORT")
+DB_NAME = os.environ.get("DB_NAME")
+DB_USER = os.environ.get("DB_USER")
+DB_PASS = os.environ.get("DB_PASSWORD")
+
+if not DB_HOST:
+    raise ValueError("DB_HOST environment variable is not set")
+
+if not DB_PORT:
+    raise ValueError("DB_PORT environment variable is not set")
+
+if not DB_NAME:
+    raise ValueError("DB_NAME environment variable is not set")
+
+if not DB_USER:
+    raise ValueError("DB_USER environment variable is not set")
+
+if not DB_PASS:
+    raise ValueError("DB_PASSWORD environment variable is not set")
 
 UNCONFIGURED = "unconfigured"
 
