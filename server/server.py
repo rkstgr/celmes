@@ -35,6 +35,7 @@ DB_NAME = os.environ.get("DB_NAME", "celmes")
 DB_USER = os.environ.get("DB_USER", "postgres")
 DB_PASS = os.environ.get("DB_PASSWORD", "emaKqste56")
 
+UNCONFIGURED = "unconfigured"
 
 class NodeConfig(BaseModel):
     node_id: str
@@ -135,7 +136,7 @@ class DataCollector:
                 FOREIGN KEY (node_id) REFERENCES node (node_id)
             )
             """)
-            
+
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS plate (
                 node_id TEXT NOT NULL,
@@ -284,7 +285,7 @@ class DataCollector:
                 "session/last/**",  # Handles node/plate/channel queries
                 self._handle_session_query
             )
-            
+
             # Subscribe to calibration_done acknowledgments from nodes
             self.ack_subscriber = self.zenoh_session.declare_subscriber(
                 "measurement/node/*/ack",
@@ -308,7 +309,7 @@ class DataCollector:
         # Stop heartbeat thread
         if hasattr(self, "heartbeat_thread"):
             self.heartbeat_thread.join(timeout=2)
-            
+
         # Undeclare all Zenoh resources
         try:
             if hasattr(self, "subscriber"):
@@ -335,7 +336,7 @@ class DataCollector:
             logger.info("Zenoh session closed")
 
         self.close_db()  # Close database connection when stopping
-        
+
     def _send_heartbeats(self):
         """Send periodic heartbeats to let nodes know the server is online"""
         while self.running:
@@ -528,7 +529,7 @@ class DataCollector:
             row = cursor.fetchone()
             if row and row[0] is not None:
                 session_data["target_voltage"] = float(row[0])
-                
+
             # ✅ Get resistance and chX_cal_resistances from the plate table
             cursor.execute(
                 """
@@ -584,11 +585,11 @@ class DataCollector:
         """Handle acknowledgment messages from node and update respective database tables"""
         try:
             message = json.loads(sample.payload.to_string())
-            
+
             action = message.get("action")
             node_id = message.get("node_id")
             plate_id = message.get("plate_id")
-            
+
             if action == "set_calibration":
                 channel = message.get("channel")
                 cal_resistance = message.get("cal_resistance")
@@ -682,7 +683,7 @@ class DataCollector:
             else:
                 cursor.execute(
                     """
-                    INSERT INTO environmental_data 
+                    INSERT INTO environmental_data
                     (time, node_id, temperature, humidity, pressure)
                     VALUES (%s, %s, %s, %s, %s)
                     """,
@@ -733,18 +734,15 @@ class DataCollector:
                     channel = channel_data.get("channel")
                     power_mW = channel_data.get("power_mW")
                     energy_Wh = channel_data.get("energy_Wh")
-                    reported_cell_id = channel_data.get("cell_id") or "unconfigured"
 
                     # Get the current mapped cell_id for this path
                     current_cell_id = self.get_cell_for_path(
                         node_id, plate_id, channel, timestamp, cursor
                     )
 
-                    # 🔄 If the reported cell_id differs, update the mapping using the existing function
-                    if current_cell_id != reported_cell_id:
-                        self.reassign_path_to_cell(
-                            node_id, plate_id, channel, reported_cell_id
-                        )
+                    if current_cell_id == UNCONFIGURED:
+                        # skip and do not persist channel data
+                        continue
 
                     # Store the measurement with the correct cell_id
                     cursor.execute(
@@ -758,7 +756,7 @@ class DataCollector:
                             node_id,
                             plate_id,
                             channel,
-                            reported_cell_id,
+                            current_cell_id,
                             power_mW,
                             energy_Wh,
                         ),
@@ -789,10 +787,10 @@ class DataCollector:
             )
 
             result = cursor.fetchone()
-            return result[0] if result else "unconfigured"
+            return result[0] if result else UNCONFIGURED
         except Exception as e:
             logger.error(f"Error getting cell for path: {str(e)}")
-            return "unconfigured"
+            return UNCONFIGURED
         # Don't close cursor here since it's passed in
 
     def reassign_path_to_cell(self, node_id, plate_id, channel, new_cell_id):
@@ -817,7 +815,7 @@ class DataCollector:
 
         finally:
             cursor.close()
-            
+
     def get_nodes(self):
         """Get list of all nodes from database"""
         try:
@@ -1198,7 +1196,7 @@ async def assign_cell_control(message: Dict[str, Any]):
 
         except Exception as db_err:
             logging.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
-            
+
         # 📦 Send full control message to the node
         success = collector.send_control_message(
             node_id,
@@ -1411,7 +1409,7 @@ async def set_calibration_control(message: Dict[str, Any]):
         raise HTTPException(status_code=400, detail="Voltage must be a float")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
-    
+
 # Run server when script is executed directly
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
