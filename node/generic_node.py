@@ -198,51 +198,51 @@ class GenericNode(abc.ABC):
 #         logger.info("Connecting to Zenoh network")
 #         try:
 #             import zenoh
-# 
+#
 #             self.zenoh_session = zenoh.open(
 #                 zenoh.Config() if config is None else config
 #             )
-# 
+#
 #             # Initialize publisher for data
 #             self.data_publisher = self.zenoh_session.declare_publisher(
 #                 f"measurement/node/{self.node_id}/data"
 #             )
-# 
+#
 #             # Initialize subscriber for heartbeat messages
 #             self.heartbeat_subscriber = self.zenoh_session.declare_subscriber(
 #                 "measurement/server/heartbeat", self._handle_heartbeat
 #             )
-# 
+#
 #             # Subscribe to control messages
 #             self.control_subscriber = self.zenoh_session.declare_subscriber(
 #                 f"measurement/node/{self.node_id}/control", self._handle_control_message
 #             )
-# 
+#
 #             # Subscribe to acknowledgment messages (for buffer publishing)
 #             self.ack_subscriber = self.zenoh_session.declare_subscriber(
 #                 f"measurement/server/ack/{self.node_id}", self._handle_server_ack
 #             )
-# 
+#
 #             logger.info(f"Node {self.node_id} connected to Zenoh")
-# 
+#
 #             # Start publisher thread
 #             self.publisher_thread = threading.Thread(
 #                 target=self._publisher_worker, daemon=True
 #             )
 #             self.publisher_thread.start()
-# 
+#
 #             # Start buffer processing thread
 #             self.buffer_thread = threading.Thread(
 #                 target=self._process_buffer, daemon=True
 #             )
 #             self.buffer_thread.start()
-# 
+#
 #             # Start server checker thread
 #             self.checker_thread = threading.Thread(
 #                 target=self._check_server_status, daemon=True
 #             )
 #             self.checker_thread.start()
-# 
+#
 #             # Check for initial server availability
 #             self._check_server_connection()
 #         except Exception as e:
@@ -295,7 +295,7 @@ class GenericNode(abc.ABC):
                 "plates": [],
             },
         }
-        
+
 
         # Add plate data
         for plate in self.plates:
@@ -336,7 +336,7 @@ class GenericNode(abc.ABC):
                 plate_data["channels"].append(channel_data)
 
             payload["data"]["plates"].append(plate_data)
-            
+
             #print(payload, flush=True)
         return payload, timestamp
 
@@ -637,7 +637,7 @@ class GenericNode(abc.ABC):
                                 }
                             )
                         )
-                        
+
             elif message.get("action") == "set_calibration":
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
@@ -665,7 +665,7 @@ class GenericNode(abc.ABC):
                                 }
                             )
                         )
-                        
+
             elif message.get("action") == "assign_cell":
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
@@ -729,7 +729,7 @@ class GenericNode(abc.ABC):
 
         logger.warning(f"Plate {plate_id} not found")
         return False
-    
+
     def _set_calibration(self, plate_id, channel, target_voltage, cal_voltage):
         """Set calibration resistance for a specific plate and channel"""
         for plate in self.plates:
@@ -739,10 +739,10 @@ class GenericNode(abc.ABC):
                 plate["channels"][channel]["cal_resistance"] = cal_resistance
                 self.calibration_running = False
                 return cal_resistance
-        
+
         logger.warning(f"Plate {plate_id} not found")
         return False
-    
+
     def _assign_cell(self, plate_id, channel, cell_id, energy):
         """Assign a cell ID to a specific channel"""
         for plate in self.plates:
@@ -764,9 +764,6 @@ class GenericNode(abc.ABC):
     def _format_timestamp(self):
         """Get current time formatted as YYYY-MM-DD HH:MM:SS:MS +ZZZZ"""
         return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S:%f %z")
-
-    def load_last_session (self):
-        import requests
 
     def load_last_session(self):
         logger.info("🔄 Loading last session state from server via Zenoh...")
@@ -799,10 +796,10 @@ class GenericNode(abc.ABC):
                         else:
                             logger.warning(f"⚠️ Invalid or empty reply for {plate_id}/ch{channel_idx}")
 
-    
+
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to load session for {plate_id}/ch{channel_idx}: {str(e)}")
-            
+
     def run(self):
         """Main operation loop"""
         logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
@@ -813,7 +810,7 @@ class GenericNode(abc.ABC):
                 if not self.calibration_running:
                     self._update_environmental_data()
                     self._update_plate_readings()
-                    
+
                     self.i += 1
                     # Reset index to 0 after full cycle
                     if self.i == self.array_size:
