@@ -31,10 +31,11 @@ logger = logging.getLogger("MeasurementServer")
 # Database connection parameters
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "qpm_celmes")
+DB_NAME = os.environ.get("DB_NAME", "celmes")
 DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASS = os.environ.get("DB_PASSWORD", "password")
+DB_PASS = os.environ.get("DB_PASSWORD", "emaKqste56")
 
+UNCONFIGURED = "unconfigured"
 
 class NodeConfig(BaseModel):
     node_id: str
@@ -107,6 +108,7 @@ class DataCollector:
             cursor.execute("""
             CREATE TABLE IF NOT EXISTS cell (
                 cell_id TEXT PRIMARY KEY,
+                volume FLOAT,
                 properties JSONB,
                 created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
                 updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
@@ -130,6 +132,25 @@ class DataCollector:
                 node_id TEXT NOT NULL,
                 plate_id TEXT NOT NULL,
                 reference_voltage FLOAT,
+                bias_voltage FLOAT,
+                FOREIGN KEY (node_id) REFERENCES node (node_id)
+            )
+            """)
+
+            cursor.execute("""
+            CREATE TABLE IF NOT EXISTS plate (
+                node_id TEXT NOT NULL,
+                plate_id TEXT NOT NULL,
+                target_voltage FLOAT,
+                resistance FLOAT DEFAULT 22.0,
+                ch0_cal_resistance FLOAT DEFAULT 0.0,
+                ch1_cal_resistance FLOAT DEFAULT 0.0,
+                ch2_cal_resistance FLOAT DEFAULT 0.0,
+                ch3_cal_resistance FLOAT DEFAULT 0.0,
+                ch4_cal_resistance FLOAT DEFAULT 0.0,
+                ch5_cal_resistance FLOAT DEFAULT 0.0,
+                ch6_cal_resistance FLOAT DEFAULT 0.0,
+                PRIMARY KEY (node_id, plate_id),
                 FOREIGN KEY (node_id) REFERENCES node (node_id)
             )
             """)
@@ -203,6 +224,7 @@ class DataCollector:
         try:
             # Create Zenoh config
             zenoh_config = zenoh.Config() if config is None else config
+            zenoh_config.insert_json5("listen/endpoints", '["tcp/0.0.0.0:7447"]')
 
             # Open Zenoh session (non-async)
             self.zenoh_session = zenoh.open(zenoh_config)
@@ -258,12 +280,62 @@ class DataCollector:
                 "measurement/discovery", self._handle_discovery_query
             )
 
+            # Session state queryable (for node startup state)
+            self.session_queryable = self.zenoh_session.declare_queryable(
+                "session/last/**",  # Handles node/plate/channel queries
+                self._handle_session_query
+            )
+
+            # Subscribe to calibration_done acknowledgments from nodes
+            self.ack_subscriber = self.zenoh_session.declare_subscriber(
+                "measurement/node/*/ack",
+                self._handle_ack
+            )
+
             logger.info("Data collection started - Zenoh ready")
 
         except Exception as e:
             self.running = False
             logger.error(f"Failed to start collection: {str(e)}")
             raise
+
+    def stop_collecting(self):
+        """Stop collecting data"""
+        if not self.running:
+            return
+
+        self.running = False
+
+        # Stop heartbeat thread
+        if hasattr(self, "heartbeat_thread"):
+            self.heartbeat_thread.join(timeout=2)
+
+        # Undeclare all Zenoh resources
+        try:
+            if hasattr(self, "subscriber"):
+                self.subscriber.undeclare()
+            if hasattr(self, "buffered_subscriber"):
+                self.buffered_subscriber.undeclare()
+            if hasattr(self, "batch_subscriber"):
+                self.batch_subscriber.undeclare()
+            if hasattr(self, "ping_subscriber"):
+                self.ping_subscriber.undeclare()
+            if hasattr(self, "heartbeat_publisher"):
+                self.heartbeat_publisher.undeclare()
+            if hasattr(self, "discovery_queryable"):
+                self.discovery_queryable.undeclare()
+            if hasattr(self, "session_queryable"):
+                self.session_queryable.undeclare()
+            if hasattr(self, "ack_subscriber"):
+                self.ack_subscriber.undeclare()
+        except Exception as e:
+            logger.warning(f"⚠️ Error during Zenoh resource cleanup: {e}")
+
+        if self.zenoh_session:
+            self.zenoh_session.close()
+            logger.info("Zenoh session closed")
+
+        self.close_db()  # Close database connection when stopping
 
     def _send_heartbeats(self):
         """Send periodic heartbeats to let nodes know the server is online"""
@@ -335,23 +407,6 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Error handling buffer batch: {str(e)}")
 
-    def stop_collecting(self):
-        """Stop collecting data"""
-        if not self.running:
-            return
-
-        self.running = False
-
-        # Stop heartbeat thread
-        if hasattr(self, "heartbeat_thread"):
-            self.heartbeat_thread.join(timeout=2)
-
-        if self.zenoh_session:
-            self.zenoh_session.close()
-            logger.info("Zenoh session closed")
-
-        self.close_db()  # Close database connection when stopping
-
     def _handle_data(self, sample):
         """Process incoming data from nodes"""
         try:
@@ -403,6 +458,166 @@ class DataCollector:
             logger.debug(f"Discovery query: returned {len(nodes_list)} nodes")
         except Exception as e:
             logger.error(f"Discovery query failed: {str(e)}")
+
+    def _handle_session_query(self, query):
+        try:
+            # Parse the resource path: session/last/<node_id>/<plate_id>/<channel>
+            parts = str(query.key_expr).split("/")
+            if len(parts) < 5:
+                logger.warning(f"Malformed session query key: {query.key_expr}")
+                return
+
+            _, _, node_id, plate_id, channel_str = parts
+            channel = int(channel_str)
+
+            # Default response
+            session_data = {
+                "cell_id": None,
+                "energy_Wh": 0.0,
+                "target_voltage": 1.2,
+                "resistance": 22.0,
+                "bias_voltage": 0.5,
+                "ch0_cal_resistance": 0.0,
+                "ch1_cal_resistance": 0.0,
+                "ch2_cal_resistance": 0.0,
+                "ch3_cal_resistance": 0.0,
+                "ch4_cal_resistance": 0.0,
+                "ch5_cal_resistance": 0.0,
+                "ch6_cal_resistance": 0.0,
+            }
+
+            cursor = self.connect_db().cursor()
+
+            # Get current cell_id for this path
+            cursor.execute(
+                """
+                SELECT cell_id FROM path_cell_mapping
+                WHERE node_id = %s AND plate_id = %s AND channel = %s
+                AND end_time IS NULL
+                ORDER BY start_time DESC LIMIT 1
+                """,
+                (node_id, plate_id, channel)
+            )
+            row = cursor.fetchone()
+            if row:
+                session_data["cell_id"] = row[0]
+
+            # Get last energy_Wh from channel_data
+            if session_data["cell_id"]:
+                cursor.execute(
+                    """
+                    SELECT energy_Wh FROM channel_data
+                    WHERE cell_id = %s
+                    ORDER BY time DESC
+                    LIMIT 1
+                    """,
+                    (session_data["cell_id"],)
+                )
+                row = cursor.fetchone()
+                if row:
+                    session_data["energy_Wh"] = float(row[0])
+
+            # ✅ Get target_voltage from the plate table
+            cursor.execute(
+                """
+                SELECT target_voltage FROM plate
+                WHERE node_id = %s AND plate_id = %s
+                LIMIT 1
+                """,
+                (node_id, plate_id)
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                session_data["target_voltage"] = float(row[0])
+
+            # ✅ Get resistance and chX_cal_resistances from the plate table
+            cursor.execute(
+                """
+                SELECT resistance,
+                       ch0_cal_resistance, ch1_cal_resistance, ch2_cal_resistance,
+                       ch3_cal_resistance, ch4_cal_resistance, ch5_cal_resistance, ch6_cal_resistance
+                FROM plate
+                WHERE node_id = %s AND plate_id = %s
+                LIMIT 1
+                """,
+                (node_id, plate_id)
+            )
+            row = cursor.fetchone()
+            if row:
+                if row[0] is not None:
+                    session_data["resistance"] = float(row[0])
+                for i in range(7):
+                    col_value = row[i + 1]  # row[1] to row[7]
+                    if col_value is not None:
+                        session_data[f"ch{i}_cal_resistance"] = float(col_value)
+
+            # ✅ Get latest bias_voltage from the plate_data time series
+            cursor.execute(
+                """
+                SELECT bias_voltage FROM plate_data
+                WHERE node_id = %s AND plate_id = %s
+                ORDER BY time DESC
+                LIMIT 1
+                """,
+                (node_id, plate_id)
+            )
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                session_data["bias_voltage"] = float(row[0])
+
+            cursor.close()
+
+            try:
+                payload = json.dumps(session_data)
+                logger.debug(f"Replying to query {query.key_expr} with: {payload}")
+                query.reply(
+                    key_expr=query.key_expr,
+                    payload=payload
+                )
+                logger.info(f"🧠 Responded to session query for {node_id}/{plate_id}/ch{channel}: {session_data}")
+            except Exception as e:
+                logger.error(f"❌ Failed to reply to session query: {e}")
+
+        except Exception as e:
+            logger.error(f"Failed to handle session query {query.key_expr}: {str(e)}")
+
+    def _handle_ack(self, sample):
+        """Handle acknowledgment messages from node and update respective database tables"""
+        try:
+            message = json.loads(sample.payload.to_string())
+
+            action = message.get("action")
+            node_id = message.get("node_id")
+            plate_id = message.get("plate_id")
+
+            if action == "set_calibration":
+                channel = message.get("channel")
+                cal_resistance = message.get("cal_resistance")
+
+                if not all([node_id, plate_id, channel is not None, cal_resistance is not None]):
+                    logger.warning("⚠️ Incomplete calibration message, ignoring.")
+                    return
+
+                column_name = f"ch{channel}_cal_resistance"
+                conn = self.connect_db()
+                cursor = conn.cursor()
+
+                sql = f"""
+                    INSERT INTO plate (node_id, plate_id, {column_name})
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (node_id, plate_id)
+                    DO UPDATE SET {column_name} = EXCLUDED.{column_name}
+                """
+                cursor.execute(sql, (node_id, plate_id, cal_resistance))
+                conn.commit()
+                cursor.close()
+
+                logger.info(f"✅ Calibration complete: Updated {node_id}/{plate_id}/ch-{channel} to {cal_resistance} Ω")
+            else:
+                logger.info(f"✅ Got Acknowledgment Message from {node_id}/{plate_id} for {action}")
+
+        except Exception as e:
+            logger.error(f"❌ Failed to handle calibration_done message: {e}")
 
     def _ensure_node_exists(self, node_id):
         """Make sure the node exists in the database"""
@@ -461,28 +676,33 @@ class DataCollector:
             temperature = env_data.get("temperature")
             humidity = env_data.get("humidity")
             pressure = env_data.get("pressure")
+            if temperature == 0.0 and humidity == 0.0 and pressure == 0.0:
+                logger.info(
+                    f"Env Sensor not connected to {node_id}, Env data not saved"
+                )
+            else:
+                cursor.execute(
+                    """
+                    INSERT INTO environmental_data
+                    (time, node_id, temperature, humidity, pressure)
+                    VALUES (%s, %s, %s, %s, %s)
+                    """,
+                    (
+                        timestamp,
+                        node_id,
+                        temperature,
+                        humidity,
+                        pressure,
+                    ),
+                )
 
-            cursor.execute(
-                """
-                INSERT INTO environmental_data 
-                (time, node_id, temperature, humidity, pressure)
-                VALUES (%s, %s, %s, %s, %s)
-                """,
-                (
-                    timestamp,
-                    node_id,
-                    temperature,
-                    humidity,
-                    pressure,
-                ),
-            )
-
-            self.db_conn.commit()
+                self.db_conn.commit()
 
         except Exception as e:
             logger.error(f"Error storing environmental data: {str(e)}")
             if isinstance(e, psycopg2.Error):
                 self.close_db()  # Only close connection on database errors
+
 
     def _store_plate_data(self, node_id, timestamp, plates_data):
         """Store plate and channel data in TimescaleDB"""
@@ -492,6 +712,7 @@ class DataCollector:
             for plate in plates_data:
                 plate_id = plate.get("plate_id")
                 ref_voltage = plate.get("reference_voltage")
+                bias_voltage = plate.get("bias_voltage")
 
                 if not plate_id:
                     logger.warning("Skipping plate with missing plate_id")
@@ -501,10 +722,10 @@ class DataCollector:
                 cursor.execute(
                     """
                     INSERT INTO plate_data
-                    (time, node_id, plate_id, reference_voltage)
-                    VALUES (%s, %s, %s, %s)
+                    (time, node_id, plate_id, reference_voltage, bias_voltage)
+                    VALUES (%s, %s, %s, %s, %s)
                     """,
-                    (timestamp, node_id, plate_id, ref_voltage),
+                    (timestamp, node_id, plate_id, ref_voltage, bias_voltage),
                 )
 
                 # Store channel data
@@ -514,35 +735,16 @@ class DataCollector:
                     power_mW = channel_data.get("power_mW")
                     energy_Wh = channel_data.get("energy_Wh")
 
-                    # Check if this path already has a mapping
-                    cursor.execute(
-                        """
-                        SELECT 1 FROM path_cell_mapping
-                        WHERE node_id = %s AND plate_id = %s AND channel = %s
-                        AND end_time IS NULL
-                        """,
-                        (node_id, plate_id, channel),
-                    )
-
-                    # If no mapping exists, create default mapping to 'unconfigured'
-                    if not cursor.fetchone():
-                        logger.debug(
-                            f"New mapping: {node_id}/{plate_id}/channel-{channel} -> unconfigured"
-                        )
-                        cursor.execute(
-                            """
-                            INSERT INTO path_cell_mapping
-                            (node_id, plate_id, channel, cell_id, start_time)
-                            VALUES (%s, %s, %s, 'unconfigured', %s)
-                            """,
-                            (node_id, plate_id, channel, timestamp),
-                        )
-
-                    # Get current cell_id for this path using same connection
-                    cell_id = self._get_cell_for_path(
+                    # Get the current mapped cell_id for this path
+                    current_cell_id = self.get_cell_for_path(
                         node_id, plate_id, channel, timestamp, cursor
                     )
 
+                    if current_cell_id == UNCONFIGURED:
+                        # skip and do not persist channel data
+                        continue
+
+                    # Store the measurement with the correct cell_id
                     cursor.execute(
                         """
                         INSERT INTO channel_data
@@ -554,23 +756,13 @@ class DataCollector:
                             node_id,
                             plate_id,
                             channel,
-                            cell_id,
+                            current_cell_id,
                             power_mW,
                             energy_Wh,
                         ),
                     )
 
-                cursor.execute(
-                    """
-                    UPDATE path_cell_mapping
-                    SET end_time = %s
-                    WHERE node_id = %s AND plate_id = %s AND channel = %s
-                    AND end_time IS NULL
-                    """,
-                    (datetime.now(timezone.utc), node_id, plate_id, channel),
-                )
-
-                self.db_conn.commit()
+            self.db_conn.commit()
 
         except Exception as e:
             logger.error(f"Plate data storage failed for {node_id}: {str(e)}")
@@ -580,7 +772,8 @@ class DataCollector:
         finally:
             cursor.close()
 
-    def _get_cell_for_path(self, node_id, plate_id, channel, timestamp, cursor):
+
+    def get_cell_for_path(self, node_id, plate_id, channel, timestamp, cursor):
         """Get the cell_id for a path at a specific time using existing cursor"""
         try:
             cursor.execute(
@@ -594,11 +787,34 @@ class DataCollector:
             )
 
             result = cursor.fetchone()
-            return result[0] if result else "unconfigured"
+            return result[0] if result else UNCONFIGURED
         except Exception as e:
             logger.error(f"Error getting cell for path: {str(e)}")
-            return "unconfigured"
+            return UNCONFIGURED
         # Don't close cursor here since it's passed in
+
+    def reassign_path_to_cell(self, node_id, plate_id, channel, new_cell_id):
+        """Reassign a path to a new cell"""
+        try:
+            now = datetime.now(timezone.utc)
+            cursor = self.connect_db().cursor()
+
+            # End current mapping and create new one
+            cursor.execute(
+                "UPDATE path_cell_mapping SET end_time = %s WHERE node_id = %s AND plate_id = %s AND channel = %s AND end_time IS NULL",
+                (now, node_id, plate_id, channel),
+            )
+            cursor.execute(
+                "INSERT INTO path_cell_mapping (node_id, plate_id, channel, cell_id, start_time) VALUES (%s, %s, %s, %s, %s)",
+                (node_id, plate_id, channel, new_cell_id, now),
+            )
+            self.db_conn.commit()
+            logger.info(
+                f"🔄 Updating path_cell_mapping: reassigned {node_id}/{plate_id}/ch{channel} -> {new_cell_id}"
+            )
+
+        finally:
+            cursor.close()
 
     def get_nodes(self):
         """Get list of all nodes from database"""
@@ -702,29 +918,6 @@ class DataCollector:
             logger.error(f"Control message failed: {str(e)}")
             return False
 
-    def reassign_path_to_cell(self, node_id, plate_id, channel, new_cell_id):
-        """Reassign a path to a new cell"""
-        try:
-            now = datetime.now(timezone.utc)
-            cursor = self.connect_db().cursor()
-
-            # End current mapping and create new one
-            cursor.execute(
-                "UPDATE path_cell_mapping SET end_time = %s WHERE node_id = %s AND plate_id = %s AND channel = %s AND end_time IS NULL",
-                (now, node_id, plate_id, channel),
-            )
-            cursor.execute(
-                "INSERT INTO path_cell_mapping (node_id, plate_id, channel, cell_id, start_time) VALUES (%s, %s, %s, %s, %s)",
-                (node_id, plate_id, channel, new_cell_id, now),
-            )
-            self.db_conn.commit()
-            logger.info(
-                f"Node {node_id}: reassigned {plate_id}/ch{channel} -> {new_cell_id}"
-            )
-        finally:
-            cursor.close()
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize and cleanup services"""
@@ -802,28 +995,6 @@ async def update_node(node_config: NodeConfig):
         )
 
     return {"status": "success"}
-
-
-@app.post("/api/control/reference-voltage")
-async def set_reference_voltage(command: SetReferenceVoltage):
-    """Set reference voltage for a plate"""
-    global collector
-
-    if not collector:
-        raise HTTPException(status_code=503, detail="Service not available")
-
-    success = collector.send_control_message(
-        command.node_id,
-        "set_reference_voltage",
-        plate_id=command.plate_id,
-        value=command.value,
-    )
-
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to send control message")
-
-    return {"status": "success"}
-
 
 @app.get("/api/data/environmental")
 async def get_environmental_data(
@@ -935,6 +1106,331 @@ async def get_power_data(
         logger.error(f"Error querying power data: {str(e)}")
         raise HTTPException(status_code=500, detail="Database query error")
 
+
+
+@app.get("/api/data/cell-mapping")
+async def get_cell_mapping(
+    node_id: str,
+    plate_id: str,
+    channel: int
+):
+    """Get current cell mapping for node/plate/channel"""
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    conn = collector.connect_db()
+    cursor = conn.cursor()
+    timestamp = datetime.now().astimezone()
+    current_cell = collector.get_cell_for_path(node_id, plate_id, channel, timestamp, cursor)
+    print(timestamp, current_cell)
+    return current_cell
+
+@app.post("/api/control/assign-cell")
+async def assign_cell_control(message: Dict[str, Any]):
+    """
+    Send an 'assign_cell' control message to a specific node.
+    Expected JSON:
+    {
+        "node_id": "node-abc123",
+        "plate_id": "plate_1",
+        "channel": 2,
+        "cell_id": "abc123"
+    }
+    """
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        node_id = message["node_id"]
+        plate_id = message["plate_id"]
+        channel = message["channel"]
+        cell_id = message["cell_id"]
+        volume = message["volume"]
+        energy_override = message.get("energy_wh", None)
+
+        if energy_override is not None:
+            latest_energy = float(energy_override)
+            logger.info(
+                    f"Forwarding user defined energy ⚡ to node️: {latest_energy}Wh "
+                )
+        else:
+            # 🔍 Check for latest energy_Wh for the cell_id
+            try:
+                conn = collector.connect_db()
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT energy_Wh
+                    FROM channel_data
+                    WHERE cell_id = %s
+                    ORDER BY time DESC
+                    LIMIT 1
+                    """,
+                    (cell_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    latest_energy = float(row[0])
+                    logger.info(f"✅ Found last reported energy ⚡️ for cell '{cell_id}': {latest_energy} Wh")
+                else:
+                    latest_energy = 0.0
+                    logger.info(f"ℹ️ No prior energy found for cell '{cell_id}'. Starting fresh at 0.0 Wh")
+                cursor.close()
+            except Exception as db_err:
+                logging.warning(f"⚠️ Could not retrieve energy for cell '{cell_id}': {db_err}")
+                latest_energy = 0.0
+
+        # 🔐 Ensure the cell_id exists in the cell table
+        try:
+            conn = collector.connect_db()
+            cursor = conn.cursor()
+
+            cursor.execute(
+                """
+                INSERT INTO cell (cell_id, volume, properties)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (cell_id) DO NOTHING
+                RETURNING cell_id
+                """,
+                (cell_id, volume, json.dumps({"source": "auto-created by node"})),
+            )
+            inserted = cursor.fetchone()
+
+            if inserted:
+                logger.info(f"➕ Added new cell_id: '{cell_id}' with volume={volume}")
+            else:
+                cursor.execute(
+                    """
+                    UPDATE cell
+                    SET volume = %s,
+                        updated_at = NOW()
+                    WHERE cell_id = %s
+                    """,
+                    (volume, cell_id),
+                )
+                logger.info(f"✅ Updated cell_id: '{cell_id}' with new volume={volume}")
+
+        except Exception as db_err:
+            logging.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
+
+        # 📦 Send full control message to the node
+        success = collector.send_control_message(
+            node_id,
+            action="assign_cell",
+            plate_id=plate_id,
+            channel=channel,
+            cell_id=cell_id,
+            energy=latest_energy,
+        )
+
+        if success:
+            collector.reassign_path_to_cell(node_id, plate_id, channel, cell_id)
+        if not success:
+            raise HTTPException(
+                status_code=500, detail="Failed to send assign_cell command"
+            )
+
+        return {
+            "status": "success",
+            "sent_to": node_id,
+            "cell_id": cell_id,
+            "energy": latest_energy,
+        }
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+@app.post("/api/control/set-reference-voltage")
+async def set_reference_voltage_control(message: Dict[str, Any]):
+    """
+    Send a 'set_reference_voltage' control message to a specific node.
+    Also updates the target_voltage in the plate_config table.
+    Expected JSON:
+    {
+        "node_id": "node-abc123",
+        "plate_id": "plate_1",
+        "target_voltage": 1.20
+    }
+    """
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        node_id = message["node_id"]
+        plate_id = message["plate_id"]
+        target_voltage = float(message["target_voltage"])
+
+        if not (0.0 <= target_voltage <= 4.095):
+            raise HTTPException(
+                status_code=400,
+                detail="Voltage must be between 1.0V and 5.0V"
+            )
+
+        # ✅ Update the target voltage in plate table
+        try:
+            conn = collector.connect_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO plate (node_id, plate_id, target_voltage)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (node_id, plate_id)
+                DO UPDATE SET target_voltage = EXCLUDED.target_voltage
+            """, (node_id, plate_id, target_voltage))
+            conn.commit()
+            cursor.close()
+            logger.info(f"💾 Updated target_voltage for {node_id}/{plate_id} to {target_voltage}V")
+        except Exception as db_err:
+            logger.warning(f"⚠️ Failed to update plate table: {db_err}")
+
+        # ✅ Send the control message to the node
+        success = collector.send_control_message(
+            node_id,
+            action="set_reference_voltage",
+            plate_id=plate_id,
+            target_voltage=target_voltage
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send set_reference_voltage command"
+            )
+
+        return {"status": "success", "sent_to": node_id, "voltage": target_voltage}
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Voltage must be a float")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+@app.post("/api/control/set-resistance")
+async def set_resistance_control(message: Dict[str, Any]):
+    """
+    Send a 'set_resistance' control message to a specific node.
+    Also updates the resistance in the plate table.
+    Expected JSON:
+    {
+        "node_id": "node-abc123",
+        "plate_id": "plate_1",
+        "resistance": 1.20
+    }
+    """
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        node_id = message["node_id"]
+        plate_id = message["plate_id"]
+        resistance = float(message["resistance"])
+
+        if not (0.0 <= resistance <= 100):
+            raise HTTPException(
+                status_code=400,
+                detail="Resistor value must be between 0ohm and 100ohm"
+            )
+
+        # ✅ Update the resistance in plate table
+        try:
+            conn = collector.connect_db()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO plate (node_id, plate_id, resistance)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (node_id, plate_id)
+                DO UPDATE SET resistance = EXCLUDED.resistance
+            """, (node_id, plate_id, resistance))
+            conn.commit()
+            cursor.close()
+            logger.info(f"💾 Updated resistance for {node_id}/{plate_id} to {resistance}ohm")
+        except Exception as db_err:
+            logger.warning(f"⚠️ Failed to update plate table: {db_err}")
+
+        # ✅ Send the control message to the node
+        success = collector.send_control_message(
+            node_id,
+            action="set_resistance",
+            plate_id=plate_id,
+            resistance=resistance
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send set_resistance command"
+            )
+
+        return {"status": "success", "sent_to": node_id, "resistance": resistance}
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Voltage must be a float")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+@app.post("/api/control/set-calibration")
+async def set_calibration_control(message: Dict[str, Any]):
+    """
+    Send a 'set_calibration' control message to a specific node.
+    Also updates the chx_cal_resistance in the plate table.
+    Expected JSON:
+    {
+        "node_id": "node-abc123",
+        "plate_id": "plate_1",
+        "channel": "0"
+        "targe_voltage": 1.0,
+        "cal_voltage": 2.2
+    }
+    """
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    try:
+        node_id = message["node_id"]
+        plate_id = message["plate_id"]
+        channel = message["channel"]
+        target_voltage = message["target_voltage"]
+        cal_voltage = message["cal_voltage"]
+
+
+        # ✅ Send the control message to the node
+        success = collector.send_control_message(
+            node_id,
+            action = "set_calibration",
+            plate_id = plate_id,
+            channel = channel,
+            target_voltage = target_voltage,
+            cal_voltage = cal_voltage
+        )
+
+        if not success:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to send set_calibration command"
+            )
+
+        return {"status": "success", "sent_to": node_id, "plate_id": plate_id, "channel": channel}
+
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Voltage must be a float")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 # Run server when script is executed directly
 if __name__ == "__main__":

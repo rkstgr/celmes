@@ -8,6 +8,7 @@ import argparse
 import logging
 import sys
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
@@ -73,8 +74,8 @@ def main():
             node_type = "sim"
 
         # Set default node ID and DB path based on node type
-        node_id = args.node_id or f"{node_type}-001"
-        db_path = args.db_path or (f"{node_type}_buffer.db")
+        node_id = args.node_id or "rpi-001"
+        db_path = args.db_path or "rpi_buffer.db"
 
         # Create and run the node
         logger.info(f"Starting {node_type} node with ID: {node_id}")
@@ -84,7 +85,8 @@ def main():
 
         # Connect to Zenoh
         node.connect_zenoh()
-
+        # Load Last Session
+        node.load_last_session()
         # Run the node
         node.run()
 

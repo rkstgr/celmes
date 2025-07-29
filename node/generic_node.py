@@ -15,6 +15,7 @@ from datetime import datetime
 from queue import Queue, Empty
 import signal
 import abc
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -44,12 +45,15 @@ class GenericNode(abc.ABC):
         self.buffer_count = 0
         self.is_sending_buffer = False
         self.stopping = False
+        self.array_size = 10
+        self.i = 0
+        self.calibration_running = False
 
         # Initialize environmental sensors with starting values
         self.env_data = {
-            "temperature": 21.0,  # Celsius
-            "humidity": 45.0,  # %
-            "pressure": 1013.0,  # hPa
+            "temperature": np.zeros(self.array_size),  # Celsius
+            "humidity": np.zeros(self.array_size),  # %
+            "pressure": np.zeros(self.array_size),  # hPa
         }
 
         # Initialize plates - to be populated by child classes
@@ -110,14 +114,38 @@ class GenericNode(abc.ABC):
             logger.info(f"Found {self.buffer_count} existing buffered measurements")
 
     def connect_zenoh(self, config=None):
-        """Connect to Zenoh network"""
+        """Connect to Zenoh network by scanning the subnet for the server"""
+        import socket
+        import zenoh
+
+        def is_zenoh_server(ip, port=7447, timeout=0.2):
+            try:
+                with socket.create_connection((ip, port), timeout=timeout):
+                    return True
+            except Exception:
+                return False
+
+        def find_zenoh_server(subnet="192.168.42.", port=7447):
+            logger.info(f"🔍 Scanning {subnet}1–254 for Zenoh server on port {port}...")
+            for i in range(1, 255):
+                ip = f"{subnet}{i}"
+                if is_zenoh_server(ip, port):
+                    logger.info(f"✅ Found Zenoh server at {ip}:{port}")
+                    return ip
+            logger.error("❌ No Zenoh server found in subnet.")
+            return None
+
         logger.info("Connecting to Zenoh network")
         try:
-            import zenoh
+            if config is None:
+                config = zenoh.Config()
+                server_ip = find_zenoh_server("192.168.42.", 7447)
+                if server_ip is None:
+                    raise Exception("No Zenoh server found on the subnet.")
+                    return False
+                config.insert_json5("connect/endpoints", f'["tcp/{server_ip}:7447"]')
 
-            self.zenoh_session = zenoh.open(
-                zenoh.Config() if config is None else config
-            )
+            self.zenoh_session = zenoh.open(config)
 
             # Initialize publisher for data
             self.data_publisher = self.zenoh_session.declare_publisher(
@@ -165,6 +193,62 @@ class GenericNode(abc.ABC):
             logger.error(f"Failed to connect to Zenoh: {str(e)}")
             raise
 
+#     def connect_zenoh(self, config=None):
+#         """Connect to Zenoh network"""
+#         logger.info("Connecting to Zenoh network")
+#         try:
+#             import zenoh
+#
+#             self.zenoh_session = zenoh.open(
+#                 zenoh.Config() if config is None else config
+#             )
+#
+#             # Initialize publisher for data
+#             self.data_publisher = self.zenoh_session.declare_publisher(
+#                 f"measurement/node/{self.node_id}/data"
+#             )
+#
+#             # Initialize subscriber for heartbeat messages
+#             self.heartbeat_subscriber = self.zenoh_session.declare_subscriber(
+#                 "measurement/server/heartbeat", self._handle_heartbeat
+#             )
+#
+#             # Subscribe to control messages
+#             self.control_subscriber = self.zenoh_session.declare_subscriber(
+#                 f"measurement/node/{self.node_id}/control", self._handle_control_message
+#             )
+#
+#             # Subscribe to acknowledgment messages (for buffer publishing)
+#             self.ack_subscriber = self.zenoh_session.declare_subscriber(
+#                 f"measurement/server/ack/{self.node_id}", self._handle_server_ack
+#             )
+#
+#             logger.info(f"Node {self.node_id} connected to Zenoh")
+#
+#             # Start publisher thread
+#             self.publisher_thread = threading.Thread(
+#                 target=self._publisher_worker, daemon=True
+#             )
+#             self.publisher_thread.start()
+#
+#             # Start buffer processing thread
+#             self.buffer_thread = threading.Thread(
+#                 target=self._process_buffer, daemon=True
+#             )
+#             self.buffer_thread.start()
+#
+#             # Start server checker thread
+#             self.checker_thread = threading.Thread(
+#                 target=self._check_server_status, daemon=True
+#             )
+#             self.checker_thread.start()
+#
+#             # Check for initial server availability
+#             self._check_server_connection()
+#         except Exception as e:
+#             logger.error(f"Failed to connect to Zenoh: {str(e)}")
+#             raise
+
     def close(self):
         """Close Zenoh session and database"""
         self.stopping = True
@@ -204,19 +288,23 @@ class GenericNode(abc.ABC):
             "timestamp": timestamp,
             "data": {
                 "environment": {
-                    "temperature": round(self.env_data["temperature"], 2),
-                    "humidity": round(self.env_data["humidity"], 2),
-                    "pressure": round(self.env_data["pressure"], 2),
+                    "temperature": float(round(np.mean(self.env_data["temperature"]), 2)),
+                    "humidity": float(round(np.mean(self.env_data["humidity"]), 2)),
+                    "pressure": float(round(np.mean(self.env_data["pressure"]), 2)),
                 },
                 "plates": [],
             },
         }
 
+
         # Add plate data
         for plate in self.plates:
             plate_data = {
                 "plate_id": plate["plate_id"],
-                "reference_voltage": plate["reference_voltage"],
+                "target_voltage": plate["target_voltage"],
+                "resistance": plate["resistance"],
+                "reference_voltage": float(round(np.mean(plate["channels"][7]["voltage"]), 3)),
+                "bias_voltage": float(round(plate["bias_voltage"], 3)),
                 "channels": [],
             }
 
@@ -225,25 +313,31 @@ class GenericNode(abc.ABC):
                 plate_data["address"] = plate["address"]
 
             for idx, channel in enumerate(plate["channels"]):
+                # skip the reference voltage channel
+                if idx == 7:
+                    continue;
+                # note that energy accumulates on a per-second basis
+                # whereas instantaneous power is an average over 10 seconds
                 channel_data = {
                     "channel": idx,
-                    "power_mW": round(channel["power"], 3),
-                    "energy_Wh": round(channel["energy"], 6),
+                    "power_mW": float(round(np.mean(channel["power"]), 3)),
+                    "energy_Wh": float(channel["energy"]),
                     "cell_id": channel["cell_id"],
                 }
 
                 # Add voltage if available (for hardware readings)
                 if "voltage" in channel:
-                    channel_data["voltage"] = round(channel["voltage"], 4)
+                    channel_data["voltage"] = float(round(np.mean(channel["voltage"]), 4))
 
                 # Add timestamp if available (for hardware readings)
                 if "timestamp" in channel:
-                    channel_data["timestamp"] = channel["timestamp"]
+                    channel_data["timestamp"] = str(channel["timestamp"][self.i - 1])  # self.i was incremented before this function
 
                 plate_data["channels"].append(channel_data)
 
             payload["data"]["plates"].append(plate_data)
 
+            #print(payload, flush=True)
         return payload, timestamp
 
     def _publisher_worker(self):
@@ -476,7 +570,6 @@ class GenericNode(abc.ABC):
                                     }
                                 )
                             )
-
                             # Wait a bit before sending next batch to avoid overwhelming server
                             time.sleep(1)
 
@@ -497,10 +590,10 @@ class GenericNode(abc.ABC):
 
             if message.get("action") == "set_reference_voltage":
                 plate_id = message.get("plate_id")
-                new_voltage = message.get("value")
+                target_voltage = message.get("target_voltage")
 
-                if plate_id and new_voltage is not None:
-                    self._set_reference_voltage(plate_id, new_voltage)
+                if plate_id and target_voltage is not None:
+                    self._set_reference_voltage(plate_id, target_voltage)
 
                     # Send acknowledgment
                     if self.zenoh_session:
@@ -511,8 +604,62 @@ class GenericNode(abc.ABC):
                             json.dumps(
                                 {
                                     "action": "set_reference_voltage",
+                                    "node_id": self.node_id,
                                     "plate_id": plate_id,
-                                    "value": new_voltage,
+                                    "target_voltage": target_voltage,
+                                    "status": "success",
+                                    "timestamp": self._format_timestamp(),
+                                }
+                            )
+                        )
+
+            elif message.get("action") == "set_resistance":
+                plate_id = message.get("plate_id")
+                resistance = message.get("resistance")
+
+                if plate_id and resistance is not None:
+                    self._set_resistance(plate_id, resistance)
+
+                    # Send acknowledgment
+                    if self.zenoh_session:
+                        ack_publisher = self.zenoh_session.declare_publisher(
+                            f"measurement/node/{self.node_id}/ack"
+                        )
+                        ack_publisher.put(
+                            json.dumps(
+                                {
+                                    "action": "set_resistance",
+                                    "node_id": self.node_id,
+                                    "plate_id": plate_id,
+                                    "resistance": resistance,
+                                    "status": "success",
+                                    "timestamp": self._format_timestamp(),
+                                }
+                            )
+                        )
+
+            elif message.get("action") == "set_calibration":
+                plate_id = message.get("plate_id")
+                channel = message.get("channel")
+                target_voltage = message.get("target_voltage")
+                cal_voltage = message.get("cal_voltage")
+
+                if plate_id and channel is not None:
+                    cal_resistance = self._set_calibration(plate_id, channel, target_voltage, cal_voltage)
+
+                    # Send acknowledgment
+                    if self.zenoh_session:
+                        ack_publisher = self.zenoh_session.declare_publisher(
+                            f"measurement/node/{self.node_id}/ack"
+                        )
+                        ack_publisher.put(
+                            json.dumps(
+                                {
+                                    "action": "set_calibration",
+                                    "node_id": self.node_id,
+                                    "plate_id": plate_id,
+                                    "channel": channel,
+                                    "cal_resistance": cal_resistance,
                                     "status": "success",
                                     "timestamp": self._format_timestamp(),
                                 }
@@ -523,9 +670,10 @@ class GenericNode(abc.ABC):
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
                 cell_id = message.get("cell_id")
+                energy = message.get("energy")
 
                 if plate_id is not None and channel is not None and cell_id is not None:
-                    self._assign_cell(plate_id, channel, cell_id)
+                    self._assign_cell(plate_id, channel, cell_id, energy)
 
                     # Send acknowledgment
                     if self.zenoh_session:
@@ -536,9 +684,11 @@ class GenericNode(abc.ABC):
                             json.dumps(
                                 {
                                     "action": "assign_cell",
+                                    "node_id": self.node_id,
                                     "plate_id": plate_id,
                                     "channel": channel,
                                     "cell_id": cell_id,
+                                    "energy": energy,
                                     "status": "success",
                                     "timestamp": self._format_timestamp(),
                                 }
@@ -550,22 +700,50 @@ class GenericNode(abc.ABC):
         except Exception as e:
             logger.error(f"Error handling control message: {str(e)}")
 
-    def _set_reference_voltage(self, plate_id, voltage):
+    def _set_reference_voltage(self, plate_id, target_voltage):
         """Set reference voltage for a specific plate"""
-        if not (1.0 <= voltage <= 5.0):
-            logger.warning(f"Voltage {voltage}V out of acceptable range")
+        if not (0.5 <= target_voltage <= 2.0):
+            logger.warning(f"Voltage {target_voltage}V out of acceptable range")
             return False
 
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
-                logger.info(f"Setting reference voltage for {plate_id} to {voltage}V")
-                plate["reference_voltage"] = voltage
+                logger.info(f"Setting reference voltage for {plate_id} to {target_voltage}V")
+                plate["target_voltage"] = target_voltage
                 return True
 
         logger.warning(f"Plate {plate_id} not found")
         return False
 
-    def _assign_cell(self, plate_id, channel, cell_id):
+    def _set_resistance(self, plate_id, resistance):
+        """Set resistance for a specific plate"""
+        if not (0.0 <= resistance <= 100.0):
+            logger.warning(f"Resistance {resistance}ohm out of acceptable range")
+            return False
+
+        for plate in self.plates:
+            if plate["plate_id"] == plate_id:
+                logger.info(f"Setting resistance for {plate_id} to {resistance}ohm")
+                plate["resistance"] = resistance
+                return True
+
+        logger.warning(f"Plate {plate_id} not found")
+        return False
+
+    def _set_calibration(self, plate_id, channel, target_voltage, cal_voltage):
+        """Set calibration resistance for a specific plate and channel"""
+        for plate in self.plates:
+            if plate["plate_id"] == plate_id:
+                self.calibration_running = True
+                cal_resistance = self._update_channel_calibration(plate_id, channel, target_voltage, cal_voltage)
+                plate["channels"][channel]["cal_resistance"] = cal_resistance
+                self.calibration_running = False
+                return cal_resistance
+
+        logger.warning(f"Plate {plate_id} not found")
+        return False
+
+    def _assign_cell(self, plate_id, channel, cell_id, energy):
         """Assign a cell ID to a specific channel"""
         for plate in self.plates:
             if plate["plate_id"] == plate_id:
@@ -574,6 +752,7 @@ class GenericNode(abc.ABC):
                         f"Assigning cell {cell_id} to {plate_id} channel {channel}"
                     )
                     plate["channels"][channel]["cell_id"] = cell_id
+                    plate["channels"][channel]["energy"] = energy
                     return True
                 else:
                     logger.warning(f"Invalid channel number {channel}")
@@ -586,19 +765,60 @@ class GenericNode(abc.ABC):
         """Get current time formatted as YYYY-MM-DD HH:MM:SS:MS +ZZZZ"""
         return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S:%f %z")
 
+    def load_last_session(self):
+        logger.info("🔄 Loading last session state from server via Zenoh...")
+
+        for plate in self.plates:
+            plate_id = plate["plate_id"]
+
+            for channel_idx, channel in enumerate(plate["channels"]):
+                if channel_idx == 7:
+                    continue
+                key = f"session/last/{self.node_id}/{plate_id}/{channel_idx}"
+                try:
+                    replies = self.zenoh_session.get(key, timeout=1500)  # timeout in ms
+
+                    for reply in replies:
+                        if reply.ok and reply.result:
+                            payload_bytes = bytes(reply.result.payload)
+                            payload = json.loads(payload_bytes.decode("utf-8"))
+
+                            channel["cell_id"] = payload.get("cell_id")
+                            channel["energy"] = float(payload.get("energy_Wh", 0.0))
+                            channel["cal_resistance"] = payload.get(f"ch{channel_idx}_cal_resistance")
+
+                            if channel_idx == 0:
+                                plate["target_voltage"] = float(payload.get("target_voltage", 1.2))
+                                plate["resistance"] = float(payload.get("resistance", 22.0))
+                                plate["bias_voltage"] = float(payload.get("bias_voltage", 0.5))
+
+                            logger.info(f"🧠 Restored {plate_id}/ch{channel_idx}: {payload}")
+                        else:
+                            logger.warning(f"⚠️ Invalid or empty reply for {plate_id}/ch{channel_idx}")
+
+
+                except Exception as e:
+                    logger.warning(f"⚠️ Failed to load session for {plate_id}/ch{channel_idx}: {str(e)}")
+
     def run(self):
         """Main operation loop"""
         logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
 
         try:
             while not self.stopping:
-                # Update data
-                self._update_environmental_data()
-                self._update_plate_readings()
+                # Update data (order matters)
+                if not self.calibration_running:
+                    self._update_environmental_data()
+                    self._update_plate_readings()
 
-                # Create payload and put in the publishing queue
-                payload, _ = self._prepare_data_payload()
-                self.publish_queue.put((payload, False))
+                    self.i += 1
+                    # Reset index to 0 after full cycle
+                    if self.i == self.array_size:
+                        # Create payload and put in the publishing queue
+                        payload, _ = self._prepare_data_payload()
+                        self.publish_queue.put((payload, False))
+                        self._update_reference_voltage()
+                        self.i = 0
 
                 # Wait for next second
                 time.sleep(1)
