@@ -996,7 +996,6 @@ async def update_node(node_config: NodeConfig):
 
     return {"status": "success"}
 
-
 @app.get("/api/data/environmental")
 async def get_environmental_data(
     node_id: str, start_time: str = None, end_time: str = None, limit: int = 1000
@@ -1107,6 +1106,27 @@ async def get_power_data(
         logger.error(f"Error querying power data: {str(e)}")
         raise HTTPException(status_code=500, detail="Database query error")
 
+
+
+@app.get("/api/data/cell-mapping")
+async def get_cell_mapping(
+    node_id: str,
+    plate_id: str,
+    channel: int
+):
+    """Get current cell mapping for node/plate/channel"""
+    global collector
+
+    if not collector:
+        raise HTTPException(status_code=503, detail="Service not available")
+
+    conn = collector.connect_db()
+    cursor = conn.cursor()
+    timestamp = datetime.now().astimezone()
+    current_cell = collector.get_cell_for_path(node_id, plate_id, channel, timestamp, cursor)
+    print(timestamp, current_cell)
+    return current_cell
+
 @app.post("/api/control/assign-cell")
 async def assign_cell_control(message: Dict[str, Any]):
     """
@@ -1207,6 +1227,8 @@ async def assign_cell_control(message: Dict[str, Any]):
             energy=latest_energy,
         )
 
+        if success:
+            collector.reassign_path_to_cell(node_id, plate_id, channel, cell_id)
         if not success:
             raise HTTPException(
                 status_code=500, detail="Failed to send assign_cell command"
