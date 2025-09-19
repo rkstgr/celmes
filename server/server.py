@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import threading  # Add this import at the top with other imports
 
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -1142,6 +1143,7 @@ async def get_cell_mapping(
     print(timestamp, current_cell)
     return current_cell
 
+
 @app.post("/api/control/assign-cell")
 async def assign_cell_control(message: Dict[str, Any]):
     """
@@ -1151,14 +1153,107 @@ async def assign_cell_control(message: Dict[str, Any]):
         "node_id": "node-abc123",
         "plate_id": "plate_1",
         "channel": 2,
-        "cell_id": "abc123"
+        "cell_id": "abc123",
+        "volume": 123.45,
+        "energy_wh": 0.0   # optional override
     }
     """
+    logger.info("✅ Got Here")
     global collector
 
     if not collector:
         raise HTTPException(status_code=503, detail="Service not available")
 
+    # ---------- blocking helpers (run via asyncio.to_thread) ----------
+    def _lookup_latest_energy(cell_id: str) -> float:
+        """Resolve last mapped path for this cell and read latest energy for that path."""
+        try:
+            conn = collector.connect_db()
+            try:
+                with conn.cursor() as cur:
+                    # keep bad plans from wedging the request
+                    cur.execute("SET LOCAL statement_timeout = '3000ms';")
+
+                    # Latest mapping for this cell (active OR historical)
+                    cur.execute("""
+                        SELECT node_id, plate_id, channel,
+                               start_time,
+                               COALESCE(end_time, NOW()) AS end_time
+                        FROM path_cell_mapping
+                        WHERE cell_id = %s
+                        ORDER BY start_time DESC
+                        LIMIT 1
+                    """, (cell_id,))
+                    mp = cur.fetchone()
+                    if not mp:
+                        logger.info(f"ℹ️ No prior mapping for cell '{cell_id}'. Starting at 0.0 Wh.")
+                        return 0.0
+
+                    node_id_m, plate_id_m, channel_m, start_ts, end_ts = mp
+
+                    # Fast top-N using your (node,plate,channel,time desc) index
+                    cur.execute("""
+                        SELECT energy_wh
+                        FROM channel_data
+                        WHERE node_id = %s
+                          AND plate_id = %s
+                          AND channel  = %s
+                          AND "time" BETWEEN %s AND %s
+                        ORDER BY "time" DESC
+                        LIMIT 1
+                    """, (node_id_m, plate_id_m, channel_m, start_ts, end_ts))
+                    row = cur.fetchone()
+                    if row:
+                        val = float(row[0])
+                        logger.info(f"✅ Found last energy ⚡️ for cell '{cell_id}': {val} Wh")
+                        return val
+                    else:
+                        logger.info(f"ℹ️ No energy rows in mapped window for cell '{cell_id}'. Using 0.0 Wh.")
+                        return 0.0
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as db_err:
+            logger.warning(f"⚠️ Could not retrieve energy for cell '{cell_id}': {db_err}")
+            return 0.0
+
+    def _ensure_cell_row(cell_id: str, volume):
+        """Insert-or-update the cell row."""
+        try:
+            conn = collector.connect_db()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO cell (cell_id, volume, properties)
+                        VALUES (%s, %s, %s)
+                        ON CONFLICT (cell_id) DO NOTHING
+                        RETURNING cell_id
+                    """, (cell_id, volume, json.dumps({"source": "auto-created by node"})))
+                    inserted = cur.fetchone()
+
+                    if inserted:
+                        logger.info(f"➕ Added new cell_id: '{cell_id}' with volume={volume}")
+                    else:
+                        cur.execute("""
+                            UPDATE cell
+                            SET volume = %s,
+                                updated_at = NOW()
+                            WHERE cell_id = %s
+                        """, (volume, cell_id))
+                        logger.info(f"✅ Updated cell_id: '{cell_id}' with new volume={volume}")
+
+                conn.commit()
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        except Exception as db_err:
+            logger.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
+
+    # -------------------- main logic --------------------
     try:
         node_id = message["node_id"]
         plate_id = message["plate_id"]
@@ -1169,70 +1264,15 @@ async def assign_cell_control(message: Dict[str, Any]):
 
         if energy_override is not None:
             latest_energy = float(energy_override)
-            logger.info(
-                    f"Forwarding user defined energy ⚡ to node️: {latest_energy}Wh "
-                )
+            logger.info(f"↪️ Forwarding user-defined energy ⚡ to node: {latest_energy} Wh")
         else:
-            # 🔍 Check for latest energy_Wh for the cell_id
-            try:
-                conn = collector.connect_db()
-                cursor = conn.cursor()
-                cursor.execute(
-                    """
-                    SELECT energy_Wh
-                    FROM channel_data
-                    WHERE cell_id = %s
-                    ORDER BY time DESC
-                    LIMIT 1
-                    """,
-                    (cell_id,)
-                )
-                row = cursor.fetchone()
-                if row:
-                    latest_energy = float(row[0])
-                    logger.info(f"✅ Found last reported energy ⚡️ for cell '{cell_id}': {latest_energy} Wh")
-                else:
-                    latest_energy = 0.0
-                    logger.info(f"ℹ️ No prior energy found for cell '{cell_id}'. Starting fresh at 0.0 Wh")
-                cursor.close()
-            except Exception as db_err:
-                logging.warning(f"⚠️ Could not retrieve energy for cell '{cell_id}': {db_err}")
-                latest_energy = 0.0
+            # Run the DB lookup off the event loop
+            latest_energy = await asyncio.to_thread(_lookup_latest_energy, cell_id)
 
-        # 🔐 Ensure the cell_id exists in the cell table
-        try:
-            conn = collector.connect_db()
-            cursor = conn.cursor()
+        # Ensure 'cell' exists/updated without blocking the event loop
+        await asyncio.to_thread(_ensure_cell_row, cell_id, volume)
 
-            cursor.execute(
-                """
-                INSERT INTO cell (cell_id, volume, properties)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (cell_id) DO NOTHING
-                RETURNING cell_id
-                """,
-                (cell_id, volume, json.dumps({"source": "auto-created by node"})),
-            )
-            inserted = cursor.fetchone()
-
-            if inserted:
-                logger.info(f"➕ Added new cell_id: '{cell_id}' with volume={volume}")
-            else:
-                cursor.execute(
-                    """
-                    UPDATE cell
-                    SET volume = %s,
-                        updated_at = NOW()
-                    WHERE cell_id = %s
-                    """,
-                    (volume, cell_id),
-                )
-                logger.info(f"✅ Updated cell_id: '{cell_id}' with new volume={volume}")
-
-        except Exception as db_err:
-            logging.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
-
-        # 📦 Send full control message to the node
+        # Send control message to the node
         success = collector.send_control_message(
             node_id,
             action="assign_cell",
@@ -1244,10 +1284,8 @@ async def assign_cell_control(message: Dict[str, Any]):
 
         if success:
             collector.reassign_path_to_cell(node_id, plate_id, channel, cell_id)
-        if not success:
-            raise HTTPException(
-                status_code=500, detail="Failed to send assign_cell command"
-            )
+        else:
+            raise HTTPException(status_code=500, detail="Failed to send assign_cell command")
 
         return {
             "status": "success",
