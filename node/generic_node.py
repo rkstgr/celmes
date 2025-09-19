@@ -35,13 +35,14 @@ class GenericNode(abc.ABC):
     """Generic measurement node with offline buffering capability"""
 
     def __init__(
-        self, node_id=None, num_plates=4, buffer_db_path="measurement_buffer.db"
+        self, node_id=None, num_plates=8, buffer_db_path="measurement_buffer.db"
     ):
         self.node_id = node_id or f"node-{uuid.uuid4().hex[:8]}"
         self.num_plates = num_plates
         self.buffer_db_path = buffer_db_path
         self.server_online = False
         self.publish_queue = Queue()
+        self.cal_jobs = Queue()
         self.buffer_count = 0
         self.is_sending_buffer = False
         self.stopping = False
@@ -198,51 +199,51 @@ class GenericNode(abc.ABC):
 #         logger.info("Connecting to Zenoh network")
 #         try:
 #             import zenoh
-#
+# 
 #             self.zenoh_session = zenoh.open(
 #                 zenoh.Config() if config is None else config
 #             )
-#
+# 
 #             # Initialize publisher for data
 #             self.data_publisher = self.zenoh_session.declare_publisher(
 #                 f"measurement/node/{self.node_id}/data"
 #             )
-#
+# 
 #             # Initialize subscriber for heartbeat messages
 #             self.heartbeat_subscriber = self.zenoh_session.declare_subscriber(
 #                 "measurement/server/heartbeat", self._handle_heartbeat
 #             )
-#
+# 
 #             # Subscribe to control messages
 #             self.control_subscriber = self.zenoh_session.declare_subscriber(
 #                 f"measurement/node/{self.node_id}/control", self._handle_control_message
 #             )
-#
+# 
 #             # Subscribe to acknowledgment messages (for buffer publishing)
 #             self.ack_subscriber = self.zenoh_session.declare_subscriber(
 #                 f"measurement/server/ack/{self.node_id}", self._handle_server_ack
 #             )
-#
+# 
 #             logger.info(f"Node {self.node_id} connected to Zenoh")
-#
+# 
 #             # Start publisher thread
 #             self.publisher_thread = threading.Thread(
 #                 target=self._publisher_worker, daemon=True
 #             )
 #             self.publisher_thread.start()
-#
+# 
 #             # Start buffer processing thread
 #             self.buffer_thread = threading.Thread(
 #                 target=self._process_buffer, daemon=True
 #             )
 #             self.buffer_thread.start()
-#
+# 
 #             # Start server checker thread
 #             self.checker_thread = threading.Thread(
 #                 target=self._check_server_status, daemon=True
 #             )
 #             self.checker_thread.start()
-#
+# 
 #             # Check for initial server availability
 #             self._check_server_connection()
 #         except Exception as e:
@@ -295,7 +296,7 @@ class GenericNode(abc.ABC):
                 "plates": [],
             },
         }
-
+        
 
         # Add plate data
         for plate in self.plates:
@@ -336,7 +337,7 @@ class GenericNode(abc.ABC):
                 plate_data["channels"].append(channel_data)
 
             payload["data"]["plates"].append(plate_data)
-
+            
             #print(payload, flush=True)
         return payload, timestamp
 
@@ -637,35 +638,23 @@ class GenericNode(abc.ABC):
                                 }
                             )
                         )
-
+                        
             elif message.get("action") == "set_calibration":
                 plate_id = message.get("plate_id")
-                channel = message.get("channel")
-                target_voltage = message.get("target_voltage")
-                cal_voltage = message.get("cal_voltage")
+                channel  = message.get("channel")
+                tgt_v    = message.get("target_voltage")
+                cal_v    = message.get("cal_voltage")
 
-                if plate_id and channel is not None:
-                    cal_resistance = self._set_calibration(plate_id, channel, target_voltage, cal_voltage)
-
-                    # Send acknowledgment
-                    if self.zenoh_session:
-                        ack_publisher = self.zenoh_session.declare_publisher(
-                            f"measurement/node/{self.node_id}/ack"
-                        )
-                        ack_publisher.put(
-                            json.dumps(
-                                {
-                                    "action": "set_calibration",
-                                    "node_id": self.node_id,
-                                    "plate_id": plate_id,
-                                    "channel": channel,
-                                    "cal_resistance": cal_resistance,
-                                    "status": "success",
-                                    "timestamp": self._format_timestamp(),
-                                }
-                            )
-                        )
-
+                # basic bounds check so we don’t queue garbage
+                if self._valid_plate_channel(plate_id, channel):
+                    self._set_calibration(plate_id, channel, tgt_v, cal_v)
+                    # < NO ack here – it will be sent after the job completes >
+                else:
+                    self._publish_calibration_ack(
+                        plate_id, channel, cal_resistance=None,
+                        status="error", info="invalid plate/channel"
+                    )
+                        
             elif message.get("action") == "assign_cell":
                 plate_id = message.get("plate_id")
                 channel = message.get("channel")
@@ -700,6 +689,49 @@ class GenericNode(abc.ABC):
         except Exception as e:
             logger.error(f"Error handling control message: {str(e)}")
 
+    def _publish_calibration_ack(self, plate_id, channel, cal_resistance,
+                                 status="success", info=""):
+        if not self.zenoh_session:
+            logger.warning("Zenoh session closed – cannot publish ack")
+            return
+
+        # cache publisher so we don’t redeclare every time
+        if not hasattr(self, "_ack_pub"):
+            self._ack_pub = self.zenoh_session.declare_publisher(
+                f"measurement/node/{self.node_id}/ack"
+            )
+
+        payload = {
+            "action": "set_calibration",
+            "node_id": self.node_id,
+            "plate_id": plate_id,
+            "channel": channel,
+            "cal_resistance": cal_resistance,
+            "status": status,
+            "info": info,
+            "timestamp": self._format_timestamp(),
+        }
+        self._ack_pub.put(json.dumps(payload))
+
+    def _valid_plate_channel(self, plate_id, channel):
+        """Return True if plate_id is in format 'plate-x' and channel is 0–6"""
+        if not isinstance(plate_id, str) or not plate_id.startswith("plate-"):
+            logger.warning(f"Invalid plate_id format: {plate_id}")
+            return False
+        try:
+            plate_num = int(plate_id.split("-")[-1])
+        except ValueError:
+            logger.warning(f"Invalid plate_id number: {plate_id}")
+            return False
+
+        if not (0 <= plate_num < self.num_plates):
+            logger.warning(f"plate_id out of range: {plate_num}")
+            return False
+        if not isinstance(channel, int) or not (0 <= channel <= 6):
+            logger.warning(f"Invalid channel: {channel}")
+            return False
+        return True
+
     def _set_reference_voltage(self, plate_id, target_voltage):
         """Set reference voltage for a specific plate"""
         if not (0.5 <= target_voltage <= 2.0):
@@ -729,20 +761,12 @@ class GenericNode(abc.ABC):
 
         logger.warning(f"Plate {plate_id} not found")
         return False
+    
+    def _set_calibration(self, plate_id, channel, target_v, cal_v):
+        self.cal_jobs.put((plate_id, channel, target_v, cal_v))
+        logger.info("🗳️ queued calibration job %s/%s", plate_id, channel)
 
-    def _set_calibration(self, plate_id, channel, target_voltage, cal_voltage):
-        """Set calibration resistance for a specific plate and channel"""
-        for plate in self.plates:
-            if plate["plate_id"] == plate_id:
-                self.calibration_running = True
-                cal_resistance = self._update_channel_calibration(plate_id, channel, target_voltage, cal_voltage)
-                plate["channels"][channel]["cal_resistance"] = cal_resistance
-                self.calibration_running = False
-                return cal_resistance
-
-        logger.warning(f"Plate {plate_id} not found")
-        return False
-
+    
     def _assign_cell(self, plate_id, channel, cell_id, energy):
         """Assign a cell ID to a specific channel"""
         for plate in self.plates:
@@ -764,6 +788,9 @@ class GenericNode(abc.ABC):
     def _format_timestamp(self):
         """Get current time formatted as YYYY-MM-DD HH:MM:SS:MS +ZZZZ"""
         return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S:%f %z")
+
+    def load_last_session (self):
+        import requests
 
     def load_last_session(self):
         logger.info("🔄 Loading last session state from server via Zenoh...")
@@ -796,17 +823,42 @@ class GenericNode(abc.ABC):
                         else:
                             logger.warning(f"⚠️ Invalid or empty reply for {plate_id}/ch{channel_idx}")
 
-
+    
                 except Exception as e:
                     logger.warning(f"⚠️ Failed to load session for {plate_id}/ch{channel_idx}: {str(e)}")
-
+  
     def run(self):
         """Main operation loop"""
         logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
 
         try:
             while not self.stopping:
-                # Update data (order matters)
+                # ---------------- Calibration dispatcher ----------------
+                if not self.calibration_running and not self.cal_jobs.empty():
+                    plate_id, ch, tgt_v, cal_v = self.cal_jobs.get()
+                    self.calibration_running = True
+                    try:
+                        cal_r = self._update_channel_calibration(plate_id, ch, tgt_v, cal_v)
+
+                        # Update internal state
+                        for p in self.plates:
+                            if p["plate_id"] == plate_id:
+                                p["channels"][ch]["cal_resistance"] = cal_r
+                                break
+
+                        logger.info(f"✅ Calibration finished: Rcal={cal_r}")
+                        self._publish_calibration_ack(plate_id, ch, cal_r)
+
+                    except Exception as e:
+                        logger.error(f"❌ Calibration failed: {e}")
+                        self._publish_calibration_ack(
+                            plate_id, ch, cal_resistance=None,
+                            status="error", info=str(e)
+                        )
+                    finally:
+                        self.calibration_running = False
+
+                # ---------------- Main data acquisition loop ----------------
                 if not self.calibration_running:
                     self._update_environmental_data()
                     self._update_plate_readings()
@@ -814,7 +866,6 @@ class GenericNode(abc.ABC):
                     self.i += 1
                     # Reset index to 0 after full cycle
                     if self.i == self.array_size:
-                        # Create payload and put in the publishing queue
                         payload, _ = self._prepare_data_payload()
                         self.publish_queue.put((payload, False))
                         self._update_reference_voltage()
@@ -829,3 +880,33 @@ class GenericNode(abc.ABC):
             logger.error(f"Error in node operation: {str(e)}")
         finally:
             self.close()
+
+#     def run(self):
+#         """Main operation loop"""
+#         logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
+# 
+#         try:
+#             while not self.stopping:
+#                 # Update data (order matters)
+#                 if not self.calibration_running:
+#                     self._update_environmental_data()
+#                     self._update_plate_readings()
+#                     
+#                     self.i += 1
+#                     # Reset index to 0 after full cycle
+#                     if self.i == self.array_size:
+#                         # Create payload and put in the publishing queue
+#                         payload, _ = self._prepare_data_payload()
+#                         self.publish_queue.put((payload, False))
+#                         self._update_reference_voltage()
+#                         self.i = 0
+# 
+#                 # Wait for next second
+#                 time.sleep(1)
+# 
+#         except KeyboardInterrupt:
+#             logger.info("Node stopped by user")
+#         except Exception as e:
+#             logger.error(f"Error in node operation: {str(e)}")
+#         finally:
+#             self.close()
