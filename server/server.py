@@ -16,6 +16,7 @@ import psycopg2.extras
 from fastapi import FastAPI, HTTPException, Depends, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+import subprocess
 from pydantic import BaseModel
 from contextlib import asynccontextmanager
 import threading  # Add this import at the top with other imports
@@ -35,21 +36,6 @@ DB_PORT = os.environ.get("DB_PORT")
 DB_NAME = os.environ.get("DB_NAME")
 DB_USER = os.environ.get("DB_USER")
 DB_PASS = os.environ.get("DB_PASSWORD")
-
-if not DB_HOST:
-    raise ValueError("DB_HOST environment variable is not set")
-
-if not DB_PORT:
-    raise ValueError("DB_PORT environment variable is not set")
-
-if not DB_NAME:
-    raise ValueError("DB_NAME environment variable is not set")
-
-if not DB_USER:
-    raise ValueError("DB_USER environment variable is not set")
-
-if not DB_PASS:
-    raise ValueError("DB_PASSWORD environment variable is not set")
 
 UNCONFIGURED = "unconfigured"
 
@@ -75,6 +61,10 @@ class DataCollector:
         self.running = False
         self.nodes = {}  # Track known nodes
         self.db_conn = None  # Persistent database connection
+        # server patch 21.10.2025
+        self.db_healthy = False
+        self._buffer_failed_since_last_batch = {}  # node_id -> bool
+        self._last_db_check = 0.0  # epoch seconds for cached health
 
     def connect_db(self):
         """Connect to TimescaleDB if not already connected"""
@@ -233,6 +223,45 @@ class DataCollector:
             conn.rollback()
             logger.error(f"Error setting up database: {str(e)}")
 
+    # server patch 21.10.2025
+    def _check_db_health_pg(self) -> bool:
+        """
+        Lightweight check: uses pg_isready against the *actual* DB name.
+        Returns True if the DB accepts connections AND the specific database exists.
+        This avoids doing SQL work on every loop and doesn't write to disk.
+        """
+        try:
+            # -q = quiet; non-zero exit if db not present or not accepting
+            host = str(self.db_params.get("host", "localhost"))
+            port = str(self.db_params.get("port", 5432))
+            dbname = str(self.db_params.get("dbname", "measurement_db"))
+            user = str(self.db_params.get("user", "postgres"))
+
+            cmd = ["pg_isready", "-h", host, "-p", port, "-d", dbname, "-U", user, "-q"]
+            r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    # server patch 21.10.2025
+    def _refresh_db_health_if_due(self):
+        """
+        Only re-check health every CELMES_DB_HEALTH_PERIOD_SEC (default 5s),
+        and also refresh immediately if currently unhealthy (so recovery is quick).
+        """
+        period = float(os.environ.get("CELMES_DB_HEALTH_PERIOD_SEC", "5"))
+        now = time.time()
+        if self.db_healthy:
+            if (now - self._last_db_check) < period:
+                return
+        else:
+            # when unhealthy, allow check at most once per second
+            if (now - self._last_db_check) < min(1.0, period):
+                return
+        self.db_healthy = self._check_db_health_pg()
+        self._last_db_check = now
+
+
     def connect_zenoh(self, config=None):
         """Connect to Zenoh network"""
         logger.info("Connecting to Zenoh network")
@@ -357,17 +386,26 @@ class DataCollector:
         """Send periodic heartbeats to let nodes know the server is online"""
         while self.running:
             try:
-                self.heartbeat_publisher.put(
-                    json.dumps({"timestamp": int(time.time()), "status": "online"})
-                )
+                self._refresh_db_health_if_due()
+                if self.db_healthy:
+                    self.heartbeat_publisher.put(
+                        json.dumps({"timestamp": int(time.time()), "status": "online"})
+                    )
+                else:
+                    logger.info(f"CELMES database not healthy: {self.db_healthy}, Heartbeat stopped")
                 time.sleep(1)  # Send heartbeat every second
             except Exception as e:
                 logger.error(f"Error sending heartbeat: {str(e)}")
                 time.sleep(5)  # Back off on error
 
+    # server patch 21.10.2025
     def _handle_ping(self, sample):
         """Handle ping messages from nodes"""
         try:
+            self._refresh_db_health_if_due()
+            if not self.db_healthy:
+                logger.info(f"CELMES database not healthy: {self.db_healthy}, Ping stopped")
+                return
             message = json.loads(sample.payload.to_string())
             node_id = message.get("node_id")
 
@@ -389,14 +427,27 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Error handling ping: {str(e)}")
 
+    # server patch 21.10.2025
     def _handle_buffered_data(self, sample):
         """Process incoming buffered data from nodes"""
         # Use the same processing logic as regular data
-        self._handle_data(sample)
-        logger.debug("Processed buffered data")
+        try:
+            self._handle_data(sample)
+            logger.debug("Processed buffered data")
+        except Exception as e:
+            # Try to grab node_id to mark the batch as failed
+            try:
+                msg = json.loads(sample.payload.to_string())
+                node_id = msg.get("node_id")
+                if node_id:
+                    self._buffer_failed_since_last_batch[node_id] = True
+            except Exception:
+                pass
+            logging.error(f"Buffered data processing failed: {e}")
+            # Don't re-raise here; make the batch ACK reflect failure below.
 
+    # server patch 21.10.2025
     def _handle_buffer_batch(self, sample):
-        """Handle buffer batch metadata and send acknowledgments"""
         try:
             message = json.loads(sample.payload.to_string())
             node_id = message.get("node_id")
@@ -404,24 +455,25 @@ class DataCollector:
             count = message.get("count", 0)
 
             if node_id and batch_id:
-                # Send acknowledgment back to the node
-                ack_publisher = self.zenoh_session.declare_publisher(
-                    f"measurement/server/ack/{node_id}"
-                )
-                ack_publisher.put(
-                    json.dumps(
-                        {
-                            "batch_id": batch_id,
-                            "success": True,
-                            "timestamp": int(time.time()),
-                        }
-                    )
-                )
-                logger.info(
-                    f"Acknowledged batch of {count} measurements from node {node_id}"
-                )
+                failed = self._buffer_failed_since_last_batch.pop(node_id, False)
+                self._refresh_db_health_if_due()
+                success = (not failed) and self.db_healthy
+
+                ack = {
+                    "batch_id": batch_id,
+                    "success": bool(success),
+                    "timestamp": int(time.time()),
+                }
+                pub = self.zenoh_session.declare_publisher(f"measurement/server/ack/{node_id}")
+                pub.put(json.dumps(ack))
+
+                if success:
+                    logging.info(f"ACK ✅ batch of {count} from {node_id}")
+                else:
+                    logging.warning(f"ACK ❌ (keep buffer) for batch of {count} from {node_id}")
         except Exception as e:
-            logger.error(f"Error handling buffer batch: {str(e)}")
+            logging.error(f"Error handling buffer batch: {e}")
+
 
     def _handle_data(self, sample):
         """Process incoming data from nodes"""
@@ -716,6 +768,7 @@ class DataCollector:
 
         except Exception as e:
             logger.error(f"Error storing environmental data: {str(e)}")
+            self.db_healthy = False  # stop heartbeats immediately
             if isinstance(e, psycopg2.Error):
                 self.close_db()  # Only close connection on database errors
 
@@ -782,6 +835,7 @@ class DataCollector:
 
         except Exception as e:
             logger.error(f"Plate data storage failed for {node_id}: {str(e)}")
+            self.db_healthy = False  # stop heartbeats immediately
             if isinstance(e, psycopg2.Error):
                 self.close_db()
             raise
@@ -1299,6 +1353,126 @@ async def assign_cell_control(message: Dict[str, Any]):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
+# @app.post("/api/control/assign-cell")
+# async def assign_cell_control(message: Dict[str, Any]):
+#     """
+#     Send an 'assign_cell' control message to a specific node.
+#     Expected JSON:
+#     {
+#         "node_id": "node-abc123",
+#         "plate_id": "plate_1",
+#         "channel": 2,
+#         "cell_id": "abc123"
+#     }
+#     """
+#     logger.info(f"✅ Got Here")
+#     global collector
+# 
+#     if not collector:
+#         raise HTTPException(status_code=503, detail="Service not available")
+# 
+#     try:
+#         node_id = message["node_id"]
+#         plate_id = message["plate_id"]
+#         channel = message["channel"]
+#         cell_id = message["cell_id"]
+#         volume = message["volume"]
+#         energy_override = message.get("energy_wh", None)
+# 
+#         if energy_override is not None:
+#             latest_energy = float(energy_override)
+#             logger.info(
+#                     f"Forwarding user defined energy ⚡ to node️: {latest_energy}Wh "
+#                 )
+#         else:
+#             # 🔍 Check for latest energy_Wh for the cell_id
+#             try:
+#                 conn = collector.connect_db()
+#                 cursor = conn.cursor()
+#                 cursor.execute(
+#                     """
+#                     SELECT energy_Wh
+#                     FROM channel_data
+#                     WHERE cell_id = %s
+#                     ORDER BY time DESC
+#                     LIMIT 1
+#                     """,
+#                     (cell_id,)
+#                 )
+#                 row = cursor.fetchone()
+#                 if row:
+#                     latest_energy = float(row[0])
+#                     logger.info(f"✅ Found last reported energy ⚡️ for cell '{cell_id}': {latest_energy} Wh")
+#                 else:
+#                     latest_energy = 0.0
+#                     logger.info(f"ℹ️ No prior energy found for cell '{cell_id}'. Starting fresh at 0.0 Wh")
+#                 cursor.close()
+#             except Exception as db_err:
+#                 logging.warning(f"⚠️ Could not retrieve energy for cell '{cell_id}': {db_err}")
+#                 latest_energy = 0.0
+# 
+#         # 🔐 Ensure the cell_id exists in the cell table
+#         try:
+#             conn = collector.connect_db()
+#             cursor = conn.cursor()
+# 
+#             cursor.execute(
+#                 """
+#                 INSERT INTO cell (cell_id, volume, properties)
+#                 VALUES (%s, %s, %s)
+#                 ON CONFLICT (cell_id) DO NOTHING
+#                 RETURNING cell_id
+#                 """,
+#                 (cell_id, volume, json.dumps({"source": "auto-created by node"})),
+#             )
+#             inserted = cursor.fetchone()
+# 
+#             if inserted:
+#                 logger.info(f"➕ Added new cell_id: '{cell_id}' with volume={volume}")
+#             else:
+#                 cursor.execute(
+#                     """
+#                     UPDATE cell
+#                     SET volume = %s,
+#                         updated_at = NOW()
+#                     WHERE cell_id = %s
+#                     """,
+#                     (volume, cell_id),
+#                 )
+#                 logger.info(f"✅ Updated cell_id: '{cell_id}' with new volume={volume}")
+# 
+#         except Exception as db_err:
+#             logging.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
+# 
+#         # 📦 Send full control message to the node
+#         success = collector.send_control_message(
+#             node_id,
+#             action="assign_cell",
+#             plate_id=plate_id,
+#             channel=channel,
+#             cell_id=cell_id,
+#             energy=latest_energy,
+#         )
+# 
+#         if success:
+#             collector.reassign_path_to_cell(node_id, plate_id, channel, cell_id)
+#         if not success:
+#             raise HTTPException(
+#                 status_code=500, detail="Failed to send assign_cell command"
+#             )
+# 
+#         return {
+#             "status": "success",
+#             "sent_to": node_id,
+#             "cell_id": cell_id,
+#             "energy": latest_energy,
+#         }
+# 
+#     except KeyError as e:
+#         raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
+#     except Exception as e:
+#         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
 @app.post("/api/control/set-reference-voltage")
 async def set_reference_voltage_control(message: Dict[str, Any]):
     """
@@ -1488,3 +1662,6 @@ async def set_calibration_control(message: Dict[str, Any]):
 # Run server when script is executed directly
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
+
+
+
