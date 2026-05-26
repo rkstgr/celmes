@@ -47,7 +47,7 @@ class DaqNode(GenericNode):
         # Only initialize plates that are actually present
         for plate_idx in range(8):  # DAQC2 supports addresses 0-7
             if self.daqc2_present[plate_idx] == 1:
-                self.print_plate_calibration(plate_idx)
+               #self.print_plate_calibration(plate_idx)
                 channels = []
                 DAQC2.setLED(plate_idx, 'blue')
                 DAQC2.setDOUTall(plate_idx, 0x00)
@@ -142,7 +142,8 @@ class DaqNode(GenericNode):
                             ref_voltage = voltage
                         else:
                             # Calculate power in mW
-                            power = ((voltage - ref_voltage) / (resistance + channel["cal_resistance"])) * voltage * 1000
+                            current = (voltage - ref_voltage) / resistance  # Current through shunt/sense resistor
+                            power = ((voltage * current) + ((current * current) * channel["cal_resistance"])) * 1000  # Power deliverd starting from shunt/sense resistor + I^2*R power across cable
                             channel["power"][self.i] = power
 
                             # Compute trapezoidal energy if we have a previous entry
@@ -154,8 +155,8 @@ class DaqNode(GenericNode):
                             # Format: "2025-04-10 13:22:45:123456 +0200"
                             time_format = "%Y-%m-%d %H:%M:%S:%f %z"
 
-                            if address == 4:
-                                print(f"ch-{idx}, voltages: {channel['voltage']}", flush=True)
+                            if address == 0:
+                                print(f"ch-{idx}, voltages: {channel['voltage']}, power: {channel['power']}, current: {current}", flush=True)
 
                             try:
                                 t1 = datetime.strptime(prev_timestamp_str, time_format)
