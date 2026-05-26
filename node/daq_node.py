@@ -156,7 +156,8 @@ class DaqNode(GenericNode):
                             time_format = "%Y-%m-%d %H:%M:%S:%f %z"
 
                             if address == 0:
-                                print(f"ch-{idx}, voltages: {channel['voltage']}, power: {channel['power']}, current: {current}", flush=True)
+                                #print(f"ch-{idx}, voltages: {channel['voltage']}, power: {channel['power']}, current: {current}", flush=True)
+                                print(f"ch-{idx}, voltages: {channel['voltage']}", flush=True)
 
                             try:
                                 t1 = datetime.strptime(prev_timestamp_str, time_format)
