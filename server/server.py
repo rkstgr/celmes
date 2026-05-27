@@ -31,11 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger("MeasurementServer")
 
 # Database connection parameters
-DB_HOST = os.environ.get("DB_HOST")
-DB_PORT = os.environ.get("DB_PORT")
-DB_NAME = os.environ.get("DB_NAME")
-DB_USER = os.environ.get("DB_USER")
-DB_PASS = os.environ.get("DB_PASSWORD")
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME", "celmes")
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASS = os.environ.get("DB_PASSWORD", "emaKqste56")
 
 UNCONFIGURED = "unconfigured"
 
@@ -1273,12 +1273,21 @@ async def assign_cell_control(message: Dict[str, Any]):
             logger.warning(f"⚠️ Could not retrieve energy for cell '{cell_id}': {db_err}")
             return 0.0
 
-    def _ensure_cell_row(cell_id: str, volume):
-        """Insert-or-update the cell row."""
+    def _ensure_cell_row_and_check_reassign(
+        node_id: str, plate_id: str, channel: int, cell_id: str, volume) -> bool:
+        """
+        Upsert the 'cell' row and tell the caller whether a path reassignment is needed.
+        Returns True iff the active mapping on this (node,plate,channel) is different from 'cell_id'.
+        """
+        needs_reassign = False
         try:
             conn = collector.connect_db()
             try:
                 with conn.cursor() as cur:
+                    # keep this fast/responsive
+                    cur.execute("SET LOCAL statement_timeout = '3000ms';")
+
+                    # 1) Upsert into 'cell'
                     cur.execute("""
                         INSERT INTO cell (cell_id, volume, properties)
                         VALUES (%s, %s, %s)
@@ -1296,16 +1305,33 @@ async def assign_cell_control(message: Dict[str, Any]):
                                 updated_at = NOW()
                             WHERE cell_id = %s
                         """, (volume, cell_id))
-                        logger.info(f"✅ Updated cell_id: '{cell_id}' with new volume={volume}")
+                        logger.info(f"✅ cell_id: '{cell_id}' exists already... updating with new volume={volume}")
+
+                    # 2) Read current active mapping for this path
+                    cur.execute("""
+                        SELECT cell_id
+                        FROM path_cell_mapping
+                        WHERE node_id=%s AND plate_id=%s AND channel=%s AND end_time IS NULL
+                        ORDER BY start_time DESC
+                        LIMIT 1
+                    """, (node_id, plate_id, channel))
+                    row = cur.fetchone()
+                    current_cell = row[0] if row else None
+
+                    # 3) Decide if reassignment is needed
+                    needs_reassign = (current_cell != cell_id)
 
                 conn.commit()
             finally:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                try: conn.close()
+                except Exception: pass
         except Exception as db_err:
-            logger.warning(f"⚠️ Could not set cell table '{cell_id}': {db_err}")
+            logger.warning(f"⚠️ Could not set cell table / check mapping for '{cell_id}': {db_err}")
+            # Be conservative: don't trigger reassignment on DB error
+            needs_reassign = False
+
+        return needs_reassign
+
 
     # -------------------- main logic --------------------
     try:
@@ -1323,8 +1349,9 @@ async def assign_cell_control(message: Dict[str, Any]):
             # Run the DB lookup off the event loop
             latest_energy = await asyncio.to_thread(_lookup_latest_energy, cell_id)
 
-        # Ensure 'cell' exists/updated without blocking the event loop
-        await asyncio.to_thread(_ensure_cell_row, cell_id, volume)
+        # Ensure 'cell' exists/updated/needs-reassign without blocking the event loop
+        needs_reassign = await asyncio.to_thread(_ensure_cell_row_and_check_reassign, node_id,
+                                                 plate_id, channel, cell_id, volume)
 
         # Send control message to the node
         success = collector.send_control_message(
@@ -1337,7 +1364,10 @@ async def assign_cell_control(message: Dict[str, Any]):
         )
 
         if success:
-            collector.reassign_path_to_cell(node_id, plate_id, channel, cell_id)
+            if needs_reassign:
+                collector.reassign_path_to_cell(node_id, plate_id, channel, cell_id)
+            else:
+                logger.info(f"⚠️ cell: {cell_id} already on {plate_id} channel-{channel}: path_cell_mapping not updated")
         else:
             raise HTTPException(status_code=500, detail="Failed to send assign_cell command")
 
@@ -1347,6 +1377,7 @@ async def assign_cell_control(message: Dict[str, Any]):
             "cell_id": cell_id,
             "energy": latest_energy,
         }
+    
 
     except KeyError as e:
         raise HTTPException(status_code=400, detail=f"Missing field: {str(e)}")
