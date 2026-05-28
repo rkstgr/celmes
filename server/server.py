@@ -545,10 +545,11 @@ class DataCollector:
     def _handle_session_query(self, query):
         # Default response (energy_Wh=0.0 is correct and intentional for "unconfigured"
         # channels and for channels that have never had any stored measurements).
+        UNCONFIGURED = "unconfigured"
         session_data = {
             "requested_plate": None,
             "requested_channel": None,
-            "cell_id": None,
+            "cell_id": UNCONFIGURED,
             "energy_Wh": 0.0,
             "target_voltage": 1.2,
             "resistance": 22.0,
@@ -589,11 +590,12 @@ class DataCollector:
                 (node_id, plate_id, channel)
             )
             row = cursor.fetchone()
-            if row:
-                session_data["cell_id"] = row[0]
+            db_cell_id = row[0] if row else UNCONFIGURED
+            session_data["cell_id"] = db_cell_id
+            is_configured = db_cell_id not in (None, "", UNCONFIGURED)
 
             # Get last energy_Wh from channel_data
-            if session_data["cell_id"]:
+            if is_configured:
                 cursor.execute(
                     """
                     SELECT energy_Wh FROM channel_data
@@ -601,12 +603,12 @@ class DataCollector:
                     ORDER BY time DESC
                     LIMIT 1
                     """,
-                    (session_data["cell_id"],)
+                    (db_cell_id,)
                 )
                 row = cursor.fetchone()
-                if row:
+                if row and row[0] is not None:
                     session_data["energy_Wh"] = float(row[0])
-
+                
             # ✅ Get target_voltage from the plate table
             cursor.execute(
                 """
