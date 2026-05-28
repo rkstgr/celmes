@@ -789,11 +789,26 @@ class GenericNode(abc.ABC):
         """Get current time formatted as YYYY-MM-DD HH:MM:SS:MS +ZZZZ"""
         return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S:%f %z")
 
-    def load_last_session (self):
-        import requests
-
     def load_last_session(self):
+        """Restore last-known cell_id, energy (Wh), and calibration state from the server.
+
+        Performs one Zenoh query per active channel (0-6) using keys of the form
+        "session/last/<node_id>/<plate_id>/<channel>". Each query has a 1.5 s timeout.
+
+        IMPORTANT: This runs synchronously at startup and can take many seconds
+        (or longer) if the server is slow or some channels have problematic state
+        (e.g. mapped to "unconfigured", never had data, or the handler fails to reply).
+
+        On any missing, invalid, late, or non-matching reply the corresponding
+        channel keeps whatever values it had after __init__ (energy=0.0, cell_id=None,
+        cal_resistance=0.0). We never blindly zero a channel because of a failed query.
+
+        Plate-level fields (target_voltage, resistance, bias_voltage) are only
+        restored from replies for channel 0 of each plate.
+        """
         logger.info("🔄 Loading last session state from server via Zenoh...")
+
+        import time  # local import keeps the top-level imports clean
 
         for plate in self.plates:
             plate_id = plate["plate_id"]
@@ -801,15 +816,33 @@ class GenericNode(abc.ABC):
             for channel_idx, channel in enumerate(plate["channels"]):
                 if channel_idx == 7:
                     continue
-                key = f"session/last/{self.node_id}/{plate_id}/{channel_idx}"
-                try:
-                    replies = self.zenoh_session.get(key, timeout=1500)  # timeout in ms
 
+                key = f"session/last/{self.node_id}/{plate_id}/{channel_idx}"
+                logger.debug(f"Requesting last session for {key}")
+
+                try:
+                    replies = self.zenoh_session.get(key, timeout=1500)
+
+                    got_valid_reply = False
                     for reply in replies:
                         if reply.ok and reply.result:
                             payload_bytes = bytes(reply.result.payload)
                             payload = json.loads(payload_bytes.decode("utf-8"))
 
+                            # Correlation check using fields echoed by the server (see _handle_session_query).
+                            # If the server has not been updated yet these fields will be absent and we fall back
+                            # to applying the payload (best-effort for rolling updates).
+                            req_plate = payload.get("requested_plate")
+                            req_ch = payload.get("requested_channel")
+                            if req_plate is not None and req_ch is not None:
+                                if req_plate != plate_id or int(req_ch) != channel_idx:
+                                    logger.warning(
+                                        f"⚠️ Session reply key mismatch for {key}: "
+                                        f"payload was for {req_plate}/ch{req_ch} — ignoring this reply"
+                                    )
+                                    continue
+
+                            # Safe to apply
                             channel["cell_id"] = payload.get("cell_id")
                             channel["energy"] = float(payload.get("energy_Wh", 0.0))
                             channel["cal_resistance"] = payload.get(f"ch{channel_idx}_cal_resistance")
@@ -820,13 +853,25 @@ class GenericNode(abc.ABC):
                                 plate["bias_voltage"] = float(payload.get("bias_voltage", 0.5))
 
                             logger.info(f"🧠 Restored {plate_id}/ch{channel_idx}: {payload}")
+                            got_valid_reply = True
+                            break  # we expect at most one meaningful reply per key
                         else:
-                            logger.warning(f"⚠️ Invalid or empty reply for {plate_id}/ch{channel_idx}")
+                            logger.warning(f"⚠️ Invalid or empty reply for {key}")
 
-    
+                    if not got_valid_reply:
+                        logger.warning(
+                            f"⚠️ No usable reply for {key} within timeout — "
+                            f"keeping current channel values (energy stays at its init or last-known value)"
+                        )
+
                 except Exception as e:
-                    logger.warning(f"⚠️ Failed to load session for {plate_id}/ch{channel_idx}: {str(e)}")
-  
+                    logger.warning(f"⚠️ Exception while loading session for {key}: {str(e)}")
+
+                # Small pacing delay between queries. Reduces the chance that a late reply
+                # from channel N arrives while we are iterating replies for channel N+1,
+                # and gives the server handler a tiny breather between DB queries.
+                time.sleep(0.03)  # 30 ms
+
     def run(self):
         """Main operation loop"""
         logger.info(f"Starting node {self.node_id} with {len(self.plates)} plates")
