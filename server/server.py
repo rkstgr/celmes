@@ -31,11 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger("MeasurementServer")
 
 # Database connection parameters
-DB_HOST = os.environ.get("DB_HOST", "localhost")
-DB_PORT = os.environ.get("DB_PORT", "5432")
-DB_NAME = os.environ.get("DB_NAME", "celmes")
-DB_USER = os.environ.get("DB_USER", "postgres")
-DB_PASS = os.environ.get("DB_PASSWORD", "emaKqste56")
+DB_HOST = os.environ.get("DB_HOST")
+DB_PORT = os.environ.get("DB_PORT")
+DB_NAME = os.environ.get("DB_NAME")
+DB_USER = os.environ.get("DB_USER")
+DB_PASS = os.environ.get("DB_PASSWORD")
 
 UNCONFIGURED = "unconfigured"
 
@@ -527,32 +527,54 @@ class DataCollector:
         except Exception as e:
             logger.error(f"Discovery query failed: {str(e)}")
 
+    def _reply_session(self, query, payload: dict):
+        """Guaranteed reply helper for session/last queries.
+
+        We must never leave a client hanging for the full 1.5 s timeout because
+        we failed to call query.reply(). This helper is used on the success path,
+        the early malformed-key path, and the outer exception path.
+        """
+        try:
+            query.reply(
+                key_expr=query.key_expr,
+                payload=json.dumps(payload)
+            )
+        except Exception as e:
+            logger.error(f"❌ Failed to reply to session query {query.key_expr}: {e}")
+
     def _handle_session_query(self, query):
+        # Default response (energy_Wh=0.0 is correct and intentional for "unconfigured"
+        # channels and for channels that have never had any stored measurements).
+        session_data = {
+            "requested_plate": None,
+            "requested_channel": None,
+            "cell_id": None,
+            "energy_Wh": 0.0,
+            "target_voltage": 1.2,
+            "resistance": 22.0,
+            "bias_voltage": 0.5,
+            "ch0_cal_resistance": 0.0,
+            "ch1_cal_resistance": 0.0,
+            "ch2_cal_resistance": 0.0,
+            "ch3_cal_resistance": 0.0,
+            "ch4_cal_resistance": 0.0,
+            "ch5_cal_resistance": 0.0,
+            "ch6_cal_resistance": 0.0,
+        }
+
         try:
             # Parse the resource path: session/last/<node_id>/<plate_id>/<channel>
             parts = str(query.key_expr).split("/")
             if len(parts) < 5:
                 logger.warning(f"Malformed session query key: {query.key_expr}")
+                self._reply_session(query, session_data)
                 return
 
             _, _, node_id, plate_id, channel_str = parts
             channel = int(channel_str)
 
-            # Default response
-            session_data = {
-                "cell_id": None,
-                "energy_Wh": 0.0,
-                "target_voltage": 1.2,
-                "resistance": 22.0,
-                "bias_voltage": 0.5,
-                "ch0_cal_resistance": 0.0,
-                "ch1_cal_resistance": 0.0,
-                "ch2_cal_resistance": 0.0,
-                "ch3_cal_resistance": 0.0,
-                "ch4_cal_resistance": 0.0,
-                "ch5_cal_resistance": 0.0,
-                "ch6_cal_resistance": 0.0,
-            }
+            session_data["requested_plate"] = plate_id
+            session_data["requested_channel"] = channel
 
             cursor = self.connect_db().cursor()
 
@@ -635,19 +657,13 @@ class DataCollector:
 
             cursor.close()
 
-            try:
-                payload = json.dumps(session_data)
-                logger.debug(f"Replying to query {query.key_expr} with: {payload}")
-                query.reply(
-                    key_expr=query.key_expr,
-                    payload=payload
-                )
-                logger.info(f"🧠 Responded to session query for {node_id}/{plate_id}/ch{channel}: {session_data}")
-            except Exception as e:
-                logger.error(f"❌ Failed to reply to session query: {e}")
+            self._reply_session(query, session_data)
+            logger.info(f"🧠 Responded to session query for {node_id}/{plate_id}/ch{channel}: {session_data}")
 
         except Exception as e:
             logger.error(f"Failed to handle session query {query.key_expr}: {str(e)}")
+            # Still reply with defaults so the client does not block for the full 1.5 s timeout.
+            self._reply_session(query, session_data)
 
     def _handle_ack(self, sample):
         """Handle acknowledgment messages from node and update respective database tables"""
